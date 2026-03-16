@@ -204,7 +204,7 @@ export default function ConfigPanel({ config, onChange, onExport, exporting, pro
             disabled={exporting}
             onClick={() => onExport('multi')}
           >
-            导出分体 STL（多色打印）
+            导出 3MF + STL（多色打印）
           </button>
           <button
             className="btn btn-secondary"
@@ -213,6 +213,9 @@ export default function ConfigPanel({ config, onChange, onExport, exporting, pro
           >
             导出合体 STL（单色打印）
           </button>
+        </div>
+        <div className="export-hint">
+          3MF 文件可直接导入 Bambu Studio，自带颜色分配
         </div>
         {progress && (
           <div>

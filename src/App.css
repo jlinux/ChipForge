@@ -197,6 +197,13 @@ body {
   cursor: not-allowed;
 }
 
+.export-hint {
+  font-size: 11px;
+  color: #7f8c8d;
+  margin-top: 6px;
+  line-height: 1.4;
+}
+
 .progress-bar {
   margin-top: 10px;
   background: #0f3460;

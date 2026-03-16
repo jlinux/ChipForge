@@ -1,9 +1,15 @@
 const fs = require('fs')
 const path = require('path')
+const earcut = require('earcut')
+const AdmZip = require('adm-zip')
 
 const DEFAULT_FONT_PATH = path.join(__dirname, '../fonts/NotoSansSC-Regular.ttf')
 
+// Tiny gap (0.001mm) between body surface and protruding parts to avoid coplanar faces
+const EPS = 0.001
+
 // ─── Binary STL writer ──────────────────────────────────────────────
+// Normal is computed from (v1-v0)×(v2-v0) — so CCW winding = outward normal.
 function writeBinarySTL(triangles) {
   const n = triangles.length
   const buf = Buffer.alloc(84 + n * 50)
@@ -26,27 +32,38 @@ function writeBinarySTL(triangles) {
 }
 
 // ─── Primitive generators ───────────────────────────────────────────
+// All side/wall faces use the convention: viewed from OUTSIDE, vertices
+// wind COUNTER-CLOCKWISE → outward-pointing normal.
+
+/**
+ * Pre-compute circle vertices to ensure exact seam closure (no float drift).
+ */
+function circleVerts(radius, segments) {
+  const v = []
+  for (let i = 0; i < segments; i++) {
+    const a = (i / segments) * Math.PI * 2
+    v.push({ x: Math.cos(a) * radius, y: Math.sin(a) * radius })
+  }
+  return v
+}
 
 /**
  * Solid closed cylinder: side wall + top cap + bottom cap.
- * Axis = Z. Center at origin.
+ * Axis = Z.
  */
-function solidCylinder(radius, zBottom, zTop, segments) {
+function solidCylinder(radius, zBot, zTop, segments) {
   const tris = []
+  const cv = circleVerts(radius, segments)
   for (let i = 0; i < segments; i++) {
-    const a0 = (i / segments) * Math.PI * 2
-    const a1 = ((i + 1) / segments) * Math.PI * 2
-    const c0 = Math.cos(a0), s0 = Math.sin(a0)
-    const c1 = Math.cos(a1), s1 = Math.sin(a1)
-    const x0 = c0 * radius, y0 = s0 * radius
-    const x1 = c1 * radius, y1 = s1 * radius
-    // Side
-    tris.push([{ x: x0, y: y0, z: zTop }, { x: x1, y: y1, z: zTop }, { x: x1, y: y1, z: zBottom }])
-    tris.push([{ x: x0, y: y0, z: zTop }, { x: x1, y: y1, z: zBottom }, { x: x0, y: y0, z: zBottom }])
-    // Top cap (normal +Z)
+    const { x: x0, y: y0 } = cv[i]
+    const { x: x1, y: y1 } = cv[(i + 1) % segments]
+    // Side wall — CCW from outside → outward normal
+    tris.push([{ x: x0, y: y0, z: zTop }, { x: x0, y: y0, z: zBot }, { x: x1, y: y1, z: zBot }])
+    tris.push([{ x: x0, y: y0, z: zTop }, { x: x1, y: y1, z: zBot }, { x: x1, y: y1, z: zTop }])
+    // Top cap — CCW from above → +Z normal
     tris.push([{ x: 0, y: 0, z: zTop }, { x: x0, y: y0, z: zTop }, { x: x1, y: y1, z: zTop }])
-    // Bottom cap (normal -Z)
-    tris.push([{ x: 0, y: 0, z: zBottom }, { x: x1, y: y1, z: zBottom }, { x: x0, y: y0, z: zBottom }])
+    // Bottom cap — CW from above = CCW from below → -Z normal
+    tris.push([{ x: 0, y: 0, z: zBot }, { x: x1, y: y1, z: zBot }, { x: x0, y: y0, z: zBot }])
   }
   return tris
 }
@@ -54,41 +71,36 @@ function solidCylinder(radius, zBottom, zTop, segments) {
 /**
  * Closed annular ring (tube section). 4 faces: top, bottom, outer wall, inner wall.
  */
-function solidRing(outerR, innerR, zBottom, zTop, segments) {
+function solidRing(outerR, innerR, zBot, zTop, segments) {
   const tris = []
+  const ov = circleVerts(outerR, segments)
+  const iv = circleVerts(innerR, segments)
   for (let i = 0; i < segments; i++) {
-    const a0 = (i / segments) * Math.PI * 2
-    const a1 = ((i + 1) / segments) * Math.PI * 2
-    const c0 = Math.cos(a0), s0 = Math.sin(a0)
-    const c1 = Math.cos(a1), s1 = Math.sin(a1)
-    const ox0 = c0 * outerR, oy0 = s0 * outerR
-    const ox1 = c1 * outerR, oy1 = s1 * outerR
-    const ix0 = c0 * innerR, iy0 = s0 * innerR
-    const ix1 = c1 * innerR, iy1 = s1 * innerR
-    // Top face (+Z normal)
+    const j = (i + 1) % segments
+    const ox0 = ov[i].x, oy0 = ov[i].y, ox1 = ov[j].x, oy1 = ov[j].y
+    const ix0 = iv[i].x, iy0 = iv[i].y, ix1 = iv[j].x, iy1 = iv[j].y
+
+    // Top face (+Z) — CCW from above
     tris.push([{ x: ix0, y: iy0, z: zTop }, { x: ox0, y: oy0, z: zTop }, { x: ox1, y: oy1, z: zTop }])
     tris.push([{ x: ix0, y: iy0, z: zTop }, { x: ox1, y: oy1, z: zTop }, { x: ix1, y: iy1, z: zTop }])
-    // Bottom face (-Z normal)
-    tris.push([{ x: ox0, y: oy0, z: zBottom }, { x: ix0, y: iy0, z: zBottom }, { x: ix1, y: iy1, z: zBottom }])
-    tris.push([{ x: ox0, y: oy0, z: zBottom }, { x: ix1, y: iy1, z: zBottom }, { x: ox1, y: oy1, z: zBottom }])
-    // Outer wall
-    tris.push([{ x: ox0, y: oy0, z: zBottom }, { x: ox1, y: oy1, z: zBottom }, { x: ox1, y: oy1, z: zTop }])
-    tris.push([{ x: ox0, y: oy0, z: zBottom }, { x: ox1, y: oy1, z: zTop }, { x: ox0, y: oy0, z: zTop }])
-    // Inner wall
-    tris.push([{ x: ix1, y: iy1, z: zBottom }, { x: ix0, y: iy0, z: zBottom }, { x: ix0, y: iy0, z: zTop }])
-    tris.push([{ x: ix1, y: iy1, z: zBottom }, { x: ix0, y: iy0, z: zTop }, { x: ix1, y: iy1, z: zTop }])
+    // Bottom face (-Z) — CW from above = CCW from below
+    tris.push([{ x: ox0, y: oy0, z: zBot }, { x: ix0, y: iy0, z: zBot }, { x: ix1, y: iy1, z: zBot }])
+    tris.push([{ x: ox0, y: oy0, z: zBot }, { x: ix1, y: iy1, z: zBot }, { x: ox1, y: oy1, z: zBot }])
+    // Outer wall — CCW from outside → outward radial normal
+    tris.push([{ x: ox0, y: oy0, z: zTop }, { x: ox0, y: oy0, z: zBot }, { x: ox1, y: oy1, z: zBot }])
+    tris.push([{ x: ox0, y: oy0, z: zTop }, { x: ox1, y: oy1, z: zBot }, { x: ox1, y: oy1, z: zTop }])
+    // Inner wall — CCW from inside → inward radial normal (toward center)
+    tris.push([{ x: ix0, y: iy0, z: zBot }, { x: ix0, y: iy0, z: zTop }, { x: ix1, y: iy1, z: zTop }])
+    tris.push([{ x: ix0, y: iy0, z: zBot }, { x: ix1, y: iy1, z: zTop }, { x: ix1, y: iy1, z: zBot }])
   }
   return tris
 }
 
 /**
- * Groove "edge spot" — a small solid that protrudes radially outward from
- * the chip body edge. Shaped as a rectangular wedge approximating a strip
- * on the cylinder surface.
- *
- * Returns a closed manifold block.
+ * Groove "edge spot" — arc-shaped prism protruding outward from chip edge.
+ * Closed manifold.
  */
-function solidEdgeSpot(angle, angularWidth, bodyRadius, protrudeDepth, zBottom, zTop, arcSegments) {
+function solidEdgeSpot(angle, angularWidth, bodyRadius, protrudeDepth, zBot, zTop, arcSegments) {
   const tris = []
   const halfAng = angularWidth / 2
   const r0 = bodyRadius
@@ -100,54 +112,54 @@ function solidEdgeSpot(angle, angularWidth, bodyRadius, protrudeDepth, zBottom, 
     angles.push(angle - halfAng + (s / steps) * angularWidth)
   }
 
-  // Build as extruded arc shape (inner arc at r0, outer arc at r1)
   for (let s = 0; s < steps; s++) {
     const a0 = angles[s], a1 = angles[s + 1]
     const c0 = Math.cos(a0), s0_ = Math.sin(a0)
     const c1 = Math.cos(a1), s1_ = Math.sin(a1)
-
     const ix0 = c0 * r0, iy0 = s0_ * r0
     const ix1 = c1 * r0, iy1 = s1_ * r0
     const ox0 = c0 * r1, oy0 = s0_ * r1
     const ox1 = c1 * r1, oy1 = s1_ * r1
 
-    // Top face
+    // Top face (+Z)
     tris.push([{ x: ix0, y: iy0, z: zTop }, { x: ox0, y: oy0, z: zTop }, { x: ox1, y: oy1, z: zTop }])
     tris.push([{ x: ix0, y: iy0, z: zTop }, { x: ox1, y: oy1, z: zTop }, { x: ix1, y: iy1, z: zTop }])
-    // Bottom face
-    tris.push([{ x: ox0, y: oy0, z: zBottom }, { x: ix0, y: iy0, z: zBottom }, { x: ix1, y: iy1, z: zBottom }])
-    tris.push([{ x: ox0, y: oy0, z: zBottom }, { x: ix1, y: iy1, z: zBottom }, { x: ox1, y: oy1, z: zBottom }])
-    // Outer wall
-    tris.push([{ x: ox0, y: oy0, z: zBottom }, { x: ox1, y: oy1, z: zBottom }, { x: ox1, y: oy1, z: zTop }])
-    tris.push([{ x: ox0, y: oy0, z: zBottom }, { x: ox1, y: oy1, z: zTop }, { x: ox0, y: oy0, z: zTop }])
-    // Inner wall
-    tris.push([{ x: ix1, y: iy1, z: zBottom }, { x: ix0, y: iy0, z: zBottom }, { x: ix0, y: iy0, z: zTop }])
-    tris.push([{ x: ix1, y: iy1, z: zBottom }, { x: ix0, y: iy0, z: zTop }, { x: ix1, y: iy1, z: zTop }])
+    // Bottom face (-Z)
+    tris.push([{ x: ox0, y: oy0, z: zBot }, { x: ix0, y: iy0, z: zBot }, { x: ix1, y: iy1, z: zBot }])
+    tris.push([{ x: ox0, y: oy0, z: zBot }, { x: ix1, y: iy1, z: zBot }, { x: ox1, y: oy1, z: zBot }])
+    // Outer wall — CCW from outside
+    tris.push([{ x: ox0, y: oy0, z: zTop }, { x: ox0, y: oy0, z: zBot }, { x: ox1, y: oy1, z: zBot }])
+    tris.push([{ x: ox0, y: oy0, z: zTop }, { x: ox1, y: oy1, z: zBot }, { x: ox1, y: oy1, z: zTop }])
+    // Inner wall — CCW from inside (toward center)
+    tris.push([{ x: ix0, y: iy0, z: zBot }, { x: ix0, y: iy0, z: zTop }, { x: ix1, y: iy1, z: zTop }])
+    tris.push([{ x: ix0, y: iy0, z: zBot }, { x: ix1, y: iy1, z: zTop }, { x: ix1, y: iy1, z: zBot }])
   }
 
-  // End caps (flat faces at the start and end angle of the arc)
+  // End caps (close the arc at start and end angles)
   const aStart = angles[0], aEnd = angles[steps]
   const csS = Math.cos(aStart), snS = Math.sin(aStart)
   const csE = Math.cos(aEnd), snE = Math.sin(aEnd)
-  // Start end cap
+
+  // Start cap — normal points in -tangent direction (away from arc interior)
   tris.push([
-    { x: csS * r0, y: snS * r0, z: zBottom },
-    { x: csS * r1, y: snS * r1, z: zBottom },
+    { x: csS * r0, y: snS * r0, z: zBot },
+    { x: csS * r1, y: snS * r1, z: zBot },
     { x: csS * r1, y: snS * r1, z: zTop },
   ])
   tris.push([
-    { x: csS * r0, y: snS * r0, z: zBottom },
+    { x: csS * r0, y: snS * r0, z: zBot },
     { x: csS * r1, y: snS * r1, z: zTop },
     { x: csS * r0, y: snS * r0, z: zTop },
   ])
-  // End end cap
+
+  // End cap — normal points in +tangent direction (away from arc interior)
   tris.push([
-    { x: csE * r1, y: snE * r1, z: zBottom },
-    { x: csE * r0, y: snE * r0, z: zBottom },
+    { x: csE * r1, y: snE * r1, z: zBot },
+    { x: csE * r0, y: snE * r0, z: zBot },
     { x: csE * r0, y: snE * r0, z: zTop },
   ])
   tris.push([
-    { x: csE * r1, y: snE * r1, z: zBottom },
+    { x: csE * r1, y: snE * r1, z: zBot },
     { x: csE * r0, y: snE * r0, z: zTop },
     { x: csE * r1, y: snE * r1, z: zTop },
   ])
@@ -155,7 +167,7 @@ function solidEdgeSpot(angle, angularWidth, bodyRadius, protrudeDepth, zBottom, 
   return tris
 }
 
-// ─── Text geometry via opentype.js ──────────────────────────────────
+// ─── Text geometry via opentype.js + earcut ─────────────────────────
 
 function generateTextTriangles(text, fontFilePath, fontSize, depth) {
   let opentype
@@ -173,24 +185,25 @@ function generateTextTriangles(text, fontFilePath, fontSize, depth) {
   // Bounding box for centering
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
   for (const poly of polygons) {
-    for (const pt of poly.outer) {
-      if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x
-      if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y
-    }
-    for (const h of poly.holes) for (const pt of h) {
-      if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x
-      if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y
+    for (const pts of [poly.outer, ...poly.holes]) {
+      for (const pt of pts) {
+        if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x
+        if (pt.y < minY) minY = pt.y; if (pt.y > maxY) maxY = pt.y
+      }
     }
   }
   const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2
 
   const triangles = []
   for (const poly of polygons) {
+    // Transform: center and flip Y
     const outer = poly.outer.map(p => ({ x: p.x - cx, y: -(p.y - cy) }))
     const holes = poly.holes.map(h => h.map(p => ({ x: p.x - cx, y: -(p.y - cy) })))
-    const tris2D = earClipTriangulate(outer, holes)
 
-    // Front face (z = depth)
+    // Use earcut for robust triangulation
+    const tris2D = triangulatePoly(outer, holes)
+
+    // Front face (z = depth) — CCW from +Z → +Z normal
     for (const [a, b, c] of tris2D) {
       triangles.push([
         { x: a.x, y: a.y, z: depth },
@@ -198,7 +211,7 @@ function generateTextTriangles(text, fontFilePath, fontSize, depth) {
         { x: c.x, y: c.y, z: depth },
       ])
     }
-    // Back face (z = 0), reversed winding
+    // Back face (z = 0) — CW from +Z = CCW from -Z → -Z normal
     for (const [a, b, c] of tris2D) {
       triangles.push([
         { x: c.x, y: c.y, z: 0 },
@@ -206,26 +219,69 @@ function generateTextTriangles(text, fontFilePath, fontSize, depth) {
         { x: a.x, y: a.y, z: 0 },
       ])
     }
-    // Side walls — outer
-    addWalls(triangles, outer, 0, depth, false)
-    // Side walls — each hole (reversed winding)
-    for (const hole of holes) addWalls(triangles, hole, 0, depth, true)
+
+    // Side walls — outer contour (CCW winding → outward normals)
+    addOuterWalls(triangles, outer, 0, depth)
+    // Side walls — holes (reversed direction → inward-facing normals into hole)
+    for (const hole of holes) addHoleWalls(triangles, hole, 0, depth)
   }
 
   return triangles
 }
 
-function addWalls(tris, pts, z0, z1, reverse) {
+/**
+ * Side walls for an OUTER contour (assumed CCW).
+ * For each edge p0→p1, the exterior is on the RIGHT side.
+ * Wall quad: viewed from the right (exterior), vertices wind CCW.
+ */
+function addOuterWalls(tris, pts, z0, z1) {
   for (let i = 0; i < pts.length; i++) {
     const p0 = pts[i], p1 = pts[(i + 1) % pts.length]
-    if (reverse) {
-      tris.push([{ x: p1.x, y: p1.y, z: z0 }, { x: p0.x, y: p0.y, z: z0 }, { x: p0.x, y: p0.y, z: z1 }])
-      tris.push([{ x: p1.x, y: p1.y, z: z0 }, { x: p0.x, y: p0.y, z: z1 }, { x: p1.x, y: p1.y, z: z1 }])
-    } else {
-      tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p1.x, y: p1.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }])
-      tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }, { x: p0.x, y: p0.y, z: z1 }])
-    }
+    // Viewed from exterior (right of edge direction):
+    // bottom-start, bottom-end, top-end, top-start = CCW
+    tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p0.x, y: p0.y, z: z1 }, { x: p1.x, y: p1.y, z: z1 }])
+    tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }, { x: p1.x, y: p1.y, z: z0 }])
   }
+}
+
+/**
+ * Side walls for a HOLE contour (assumed CW when hole is inside a CCW outer).
+ * Normals point inward into the hole (outward from the solid).
+ */
+function addHoleWalls(tris, pts, z0, z1) {
+  for (let i = 0; i < pts.length; i++) {
+    const p0 = pts[i], p1 = pts[(i + 1) % pts.length]
+    // Reversed compared to outer walls
+    tris.push([{ x: p1.x, y: p1.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }, { x: p0.x, y: p0.y, z: z1 }])
+    tris.push([{ x: p1.x, y: p1.y, z: z0 }, { x: p0.x, y: p0.y, z: z1 }, { x: p0.x, y: p0.y, z: z0 }])
+  }
+}
+
+/**
+ * Triangulate a polygon with holes using earcut (robust, handles complex glyphs).
+ * Returns array of [a, b, c] triangles where a/b/c are {x, y}.
+ */
+function triangulatePoly(outer, holes) {
+  // Flatten coords for earcut
+  const coords = []
+  const holeIndices = []
+
+  for (const p of outer) { coords.push(p.x, p.y) }
+  for (const hole of holes) {
+    holeIndices.push(coords.length / 2)
+    for (const p of hole) { coords.push(p.x, p.y) }
+  }
+
+  const allPts = [...outer]
+  for (const h of holes) allPts.push(...h)
+
+  const indices = earcut(coords, holeIndices.length > 0 ? holeIndices : undefined)
+
+  const tris = []
+  for (let i = 0; i < indices.length; i += 3) {
+    tris.push([allPts[indices[i]], allPts[indices[i + 1]], allPts[indices[i + 2]]])
+  }
+  return tris
 }
 
 // ─── Opentype path → polygons ───────────────────────────────────────
@@ -246,8 +302,10 @@ function commandsToPolygons(commands) {
         const p = cur[cur.length - 1]
         for (let t = 0.1; t <= 1.001; t += 0.1) {
           const mt = 1 - t
-          cur.push({ x: mt * mt * p.x + 2 * mt * t * c.x1 + t * t * c.x,
-                     y: mt * mt * p.y + 2 * mt * t * c.y1 + t * t * c.y })
+          cur.push({
+            x: mt * mt * p.x + 2 * mt * t * c.x1 + t * t * c.x,
+            y: mt * mt * p.y + 2 * mt * t * c.y1 + t * t * c.y,
+          })
         }
         break
       }
@@ -284,7 +342,6 @@ function commandsToPolygons(commands) {
   for (const c of contours) {
     const a = signedArea(c)
     if (a < 0) {
-      // Outer contour (negative = CCW in screen-Y-down = CW math = outer for opentype)
       polys.push({ outer: c, holes: [] })
     } else if (a > 0 && polys.length > 0) {
       polys[polys.length - 1].holes.push(c)
@@ -302,98 +359,145 @@ function signedArea(pts) {
   return a / 2
 }
 
-// ─── Ear-clipping triangulation ─────────────────────────────────────
-
-function earClipTriangulate(outer, holes) {
-  let merged = [...outer]
-  for (const h of holes) merged = mergeHole(merged, h)
-  return earClip(merged)
-}
-
-function mergeHole(outer, hole) {
-  let maxI = 0
-  for (let i = 1; i < hole.length; i++) if (hole[i].x > hole[maxI].x) maxI = i
-  const bp = hole[maxI]
-
-  let bestD = Infinity, bestI = 0
-  for (let i = 0; i < outer.length; i++) {
-    const d = (outer[i].x - bp.x) ** 2 + (outer[i].y - bp.y) ** 2
-    if (d < bestD) { bestD = d; bestI = i }
-  }
-
-  const res = outer.slice(0, bestI + 1)
-  for (let i = 0; i <= hole.length; i++) res.push(hole[(maxI + i) % hole.length])
-  res.push({ ...outer[bestI] })
-  for (let i = bestI + 1; i < outer.length; i++) res.push(outer[i])
-  return res
-}
-
-function earClip(poly) {
-  const tris = []
-  const pts = poly.map(p => ({ ...p }))
-  if (pts.length < 3) return tris
-  const idx = pts.map((_, i) => i)
-  let tries = 0, maxTries = idx.length * 4
-  while (idx.length > 3 && tries < maxTries) {
-    let found = false
-    for (let i = 0; i < idx.length; i++) {
-      const pi = (i - 1 + idx.length) % idx.length
-      const ni = (i + 1) % idx.length
-      const a = pts[idx[pi]], b = pts[idx[i]], c = pts[idx[ni]]
-      if (cross2D(a, b, c) <= 1e-10) continue
-      let ear = true
-      for (let j = 0; j < idx.length; j++) {
-        if (j === pi || j === i || j === ni) continue
-        if (ptInTri(pts[idx[j]], a, b, c)) { ear = false; break }
-      }
-      if (ear) { tris.push([a, b, c]); idx.splice(i, 1); found = true; break }
-    }
-    if (!found) { tries++; idx.push(idx.shift()) }
-  }
-  if (idx.length === 3) tris.push([pts[idx[0]], pts[idx[1]], pts[idx[2]]])
-  return tris
-}
-
-function cross2D(a, b, c) { return (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x) }
-
-function ptInTri(p, a, b, c) {
-  const d1 = cross2D(a, b, p), d2 = cross2D(b, c, p), d3 = cross2D(c, a, p)
-  return !((d1 < 0 || d2 < 0 || d3 < 0) && (d1 > 0 || d2 > 0 || d3 > 0))
-}
-
 // ─── Transform helpers ──────────────────────────────────────────────
 
 function translate(tris, dx, dy, dz) {
   return tris.map(t => t.map(v => ({ x: v.x + dx, y: v.y + dy, z: v.z + dz })))
 }
 
-function mirrorZ(tris) {
-  // Mirror across XY plane: negate Z, reverse winding
-  return tris.map(([a, b, c]) => [
-    { x: a.x, y: a.y, z: -a.z },
-    { x: c.x, y: c.y, z: -c.z },
-    { x: b.x, y: b.y, z: -b.z },
-  ])
-}
-
+/**
+ * Rotate 180° around Y axis: negates X and Z.
+ * This flips handedness, so we MUST reverse winding (swap two vertices).
+ */
 function rotateY180(tris) {
   return tris.map(([a, b, c]) => [
     { x: -a.x, y: a.y, z: -a.z },
-    { x: -b.x, y: b.y, z: -b.z },
     { x: -c.x, y: c.y, z: -c.z },
+    { x: -b.x, y: b.y, z: -b.z },
   ])
+}
+
+// ─── 3MF writer ─────────────────────────────────────────────────────
+
+/**
+ * Generate a 3MF file for Bambu Studio multi-color printing.
+ *
+ * Structure: each part is a SEPARATE <object> with its own mesh.
+ * A parent object assembles them via <components>.
+ * Bambu Studio shows each component as a distinct part with its own
+ * filament/color assignment.
+ *
+ * This avoids non-manifold issues (each mesh is independently valid)
+ * and enables per-part color in Bambu Studio.
+ */
+function write3MF(partsWithColors, outputPath) {
+  let nextId = 1
+
+  // Material definitions
+  const matId = nextId++
+  const matEntries = partsWithColors.map((p, i) =>
+    `      <base name="${escXml(p.name)}" displaycolor="${p.color}" />`
+  ).join('\n')
+
+  // Build each part as a separate object
+  const objectXmls = []
+  const componentRefs = []
+
+  for (let pi = 0; pi < partsWithColors.length; pi++) {
+    const part = partsWithColors[pi]
+    const objId = nextId++
+
+    // Deduplicate vertices within this part
+    const verts = []
+    const tris = []
+    const vMap = new Map()
+
+    function addV(v) {
+      const key = `${v.x.toFixed(5)},${v.y.toFixed(5)},${v.z.toFixed(5)}`
+      if (vMap.has(key)) return vMap.get(key)
+      const idx = verts.length
+      verts.push(v)
+      vMap.set(key, idx)
+      return idx
+    }
+
+    for (const [a, b, c] of part.triangles) {
+      tris.push({ v1: addV(a), v2: addV(b), v3: addV(c) })
+    }
+
+    const vertXml = verts.map(v =>
+      `          <vertex x="${v.x}" y="${v.y}" z="${v.z}" />`
+    ).join('\n')
+
+    const triXml = tris.map(t =>
+      `          <triangle v1="${t.v1}" v2="${t.v2}" v3="${t.v3}" />`
+    ).join('\n')
+
+    objectXmls.push(`    <object id="${objId}" type="model" pid="${matId}" pindex="${pi}">
+      <mesh>
+        <vertices>
+${vertXml}
+        </vertices>
+        <triangles>
+${triXml}
+        </triangles>
+      </mesh>
+    </object>`)
+
+    componentRefs.push(`        <component objectid="${objId}" />`)
+  }
+
+  // Parent object that groups all parts
+  const parentId = nextId++
+  objectXmls.push(`    <object id="${parentId}" type="model">
+      <components>
+${componentRefs.join('\n')}
+      </components>
+    </object>`)
+
+  const modelXml = `<?xml version="1.0" encoding="UTF-8"?>
+<model unit="millimeter" xml:lang="en-US"
+  xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  <resources>
+    <basematerials id="${matId}">
+${matEntries}
+    </basematerials>
+${objectXmls.join('\n')}
+  </resources>
+  <build>
+    <item objectid="${parentId}" />
+  </build>
+</model>`
+
+  const contentTypes = `<?xml version="1.0" encoding="UTF-8"?>
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
+  <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml" />
+  <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml" />
+</Types>`
+
+  const rels = `<?xml version="1.0" encoding="UTF-8"?>
+<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">
+  <Relationship Target="/3D/3dmodel.model" Id="rel0" Type="http://schemas.microsoft.com/3dmanufacturing/2013/01/3dmodel" />
+</Relationships>`
+
+  const zip = new AdmZip()
+  zip.addFile('[Content_Types].xml', Buffer.from(contentTypes, 'utf-8'))
+  zip.addFile('_rels/.rels', Buffer.from(rels, 'utf-8'))
+  zip.addFile('3D/3dmodel.model', Buffer.from(modelXml, 'utf-8'))
+  zip.writeZip(outputPath)
+}
+
+function escXml(s) {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
 }
 
 // ─── Main generation ────────────────────────────────────────────────
 
 /**
- * Generates all chip parts as non-overlapping manifold solids.
- *
- * Strategy to avoid non-manifold:
- *   - Body = solid cylinder (complete manifold)
- *   - Text, rim ring, grooves PROTRUDE outward from body surface
- *   - No volumes overlap; parts share only a boundary face
- *   - Total chip height = thickness + 2 * textDepth
+ * Generate chip parts and export as:
+ *   - chip.3mf  (multi-color, primary format for Bambu Studio)
+ *   - individual .stl files (fallback)
+ *   - combined.stl (single-color)
  */
 async function generateSTLFiles(params, outputDir, onProgress) {
   const {
@@ -407,6 +511,7 @@ async function generateSTLFiles(params, outputDir, onProgress) {
     value = '1000',
     style = 'classic',
     fontPath,
+    colors = {},
   } = params
 
   const R = diameter / 2
@@ -419,57 +524,83 @@ async function generateSTLFiles(params, outputDir, onProgress) {
 
   const parts = {}
 
-  // ── 1. Body: solid cylinder ──
+  // 1. Body: solid cylinder
   onProgress?.({ stage: 'generating', percent: 10, detail: '主体' })
   parts.body = solidCylinder(R, -halfT, halfT, SEG)
 
-  // ── 2. Name text: protrudes from top face ──
+  // 2. Name text: protrudes from top face (+Z) with epsilon gap
   onProgress?.({ stage: 'generating', percent: 25, detail: '正面文字' })
   const fontFile = fontPath || DEFAULT_FONT_PATH
   if (name) {
     const rawText = generateTextTriangles(name, fontFile, R * 0.4, textDepth)
     if (rawText.length > 0) {
-      // Text extrusion is z=0..textDepth; move so bottom = halfT, top = halfT+textDepth
-      parts.nameText = translate(rawText, 0, 0, halfT)
+      parts.nameText = translate(rawText, 0, 0, halfT + EPS)
     }
   }
 
-  // ── 3. Value text: protrudes from bottom face ──
+  // 3. Value text: protrudes from bottom face (-Z) with epsilon gap
   onProgress?.({ stage: 'generating', percent: 40, detail: '背面文字' })
   if (value) {
     const rawVal = generateTextTriangles(value, fontFile, R * 0.5, textDepth)
     if (rawVal.length > 0) {
-      // Mirror to bottom side: rotate 180° around Y to flip text, then position
       const flipped = rotateY180(rawVal)
-      parts.valueText = translate(flipped, 0, 0, -halfT)
+      parts.valueText = translate(flipped, 0, 0, -halfT - EPS)
     }
   }
 
-  // ── 4. Grooves / edge spots (classic style) ──
+  // 4. Grooves / edge spots (classic style) — offset outward by EPS
   if (style === 'classic' && grooveCount > 0) {
     onProgress?.({ stage: 'generating', percent: 55, detail: '边缘凹槽' })
     const spotTris = []
-    const angWidth = (2 * Math.PI / grooveCount) * 0.5 // each spot covers half the slot angle
+    const angWidth = (2 * Math.PI / grooveCount) * 0.5
     const protrudeDepth = grooveRadius * 0.6
     for (let i = 0; i < grooveCount; i++) {
       const angle = (i / grooveCount) * 2 * Math.PI
-      const spot = solidEdgeSpot(angle, angWidth, R, protrudeDepth, -halfT, halfT, 4)
-      spotTris.push(...spot)
+      spotTris.push(...solidEdgeSpot(angle, angWidth, R + EPS, protrudeDepth, -halfT, halfT, 4))
     }
     parts.grooves = spotTris
   }
 
-  // ── 5. Rim rings: protrude from top & bottom faces ──
+  // 5. Rim rings: protrude from top & bottom with epsilon gap
   onProgress?.({ stage: 'generating', percent: 70, detail: '边框环' })
   const rimOuter = R - 0.5
   const rimInner = rimOuter - rimWidth
   if (rimInner > 0) {
-    const topRim = solidRing(rimOuter, rimInner, halfT, halfT + textDepth, SEG)
-    const botRim = solidRing(rimOuter, rimInner, -(halfT + textDepth), -halfT, SEG)
+    const topRim = solidRing(rimOuter, rimInner, halfT + EPS, halfT + EPS + textDepth, SEG)
+    const botRim = solidRing(rimOuter, rimInner, -(halfT + EPS + textDepth), -(halfT + EPS), SEG)
     parts.rimRing = [...topRim, ...botRim]
   }
 
-  // ── Export individual STL files ──
+  // ── Export 3MF (primary, with colors) ──
+  onProgress?.({ stage: 'exporting', percent: 75, file: 'chip.3mf' })
+  const defaultColors = {
+    body: '#FFFFFF',
+    nameText: '#C0392B',
+    valueText: '#2C3E50',
+    grooves: '#E74C3C',
+    rimRing: '#F39C12',
+  }
+  const partLabels = {
+    body: '主体',
+    nameText: '正面文字',
+    valueText: '背面文字',
+    grooves: '边缘凹槽',
+    rimRing: '边框环',
+  }
+
+  const partsWithColors = []
+  for (const [key, tris] of Object.entries(parts)) {
+    if (!tris || tris.length === 0) continue
+    partsWithColors.push({
+      name: partLabels[key] || key,
+      color: colors[key] || defaultColors[key] || '#888888',
+      triangles: tris,
+    })
+  }
+
+  write3MF(partsWithColors, path.join(folder, 'chip.3mf'))
+
+  // ── Export individual STL files (fallback) ──
   const fileMap = {
     body: 'body.stl',
     nameText: 'name_text.stl',
@@ -484,15 +615,14 @@ async function generateSTLFiles(params, outputDir, onProgress) {
     if (!tris || !fileMap[key]) continue
     fs.writeFileSync(path.join(folder, fileMap[key]), writeBinarySTL(tris))
     done++
-    onProgress?.({ stage: 'exporting', percent: 70 + (done / total) * 25, file: fileMap[key] })
+    onProgress?.({ stage: 'exporting', percent: 80 + (done / total) * 15, file: fileMap[key] })
   }
 
-  // ── Combined STL (union of all triangles — for single-color printing) ──
+  // ── Combined STL: single solid for single-color printing ──
   onProgress?.({ stage: 'combining', percent: 95 })
-  const all = Object.values(parts).flat()
-  if (all.length > 0) {
-    fs.writeFileSync(path.join(folder, 'combined.stl'), writeBinarySTL(all))
-  }
+  const totalH = thickness + 2 * textDepth
+  const combinedTris = solidCylinder(R, -totalH / 2, totalH / 2, SEG)
+  fs.writeFileSync(path.join(folder, 'combined.stl'), writeBinarySTL(combinedTris))
 
   onProgress?.({ stage: 'done', percent: 100 })
   return folder
