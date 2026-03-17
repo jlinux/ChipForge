@@ -1,18 +1,15 @@
 import React from 'react'
 import ColorPicker from './ColorPicker'
 
-const COLOR_PARTS = [
-  { key: 'body', label: '主体' },
-  { key: 'nameText', label: '正面文字' },
-  { key: 'valueText', label: '背面文字' },
-  { key: 'grooves', label: '边缘凹槽' },
-  { key: 'rimRing', label: '边框环' },
-]
+const COLOR_PARTS = ['body', 'nameText', 'valueText', 'grooves', 'rimRing']
 
 export default function ConfigPanel({
   config,
   onChange,
   onExport,
+  locale,
+  onLocaleChange,
+  t,
   exportDir,
   onSelectExportDir,
   exporting,
@@ -37,53 +34,69 @@ export default function ConfigPanel({
 
   return (
     <div>
-      <div className="panel-title">筹码生成器</div>
+      <div className="panel-header">
+        <div className="panel-title">{t('appTitle')}</div>
+        <div className="style-toggle lang-toggle">
+          <button
+            className={`style-btn ${locale === 'zh-CN' ? 'active' : ''}`}
+            onClick={() => onLocaleChange('zh-CN')}
+          >
+            {t('chinese')}
+          </button>
+          <button
+            className={`style-btn ${locale === 'en' ? 'active' : ''}`}
+            onClick={() => onLocaleChange('en')}
+          >
+            {t('english')}
+          </button>
+        </div>
+      </div>
 
       <div className="config-section">
-        <h3>文字设置</h3>
+        <h3>{t('textSettings')}</h3>
         <div className="field">
-          <label>姓名（正面）</label>
+          <label>{t('frontName')}</label>
           <input
             type="text"
             value={config.name}
             onChange={(e) => update('name', e.target.value)}
-            placeholder="输入姓名"
+            placeholder={t('enterName')}
           />
         </div>
         <div className="field">
-          <label>面值（背面）</label>
+          <label>{t('backValue')}</label>
           <input
             type="text"
             value={config.value}
             onChange={(e) => update('value', e.target.value)}
-            placeholder="输入面值"
+            placeholder={t('enterValue')}
           />
         </div>
       </div>
 
       <div className="config-section">
-        <h3>风格</h3>
+        <h3>{t('style')}</h3>
         <div className="style-toggle">
           <button
             className={`style-btn ${config.style === 'classic' ? 'active' : ''}`}
             onClick={() => update('style', 'classic')}
           >
-            经典
+            {t('classic')}
           </button>
           <button
             className={`style-btn ${config.style === 'minimal' ? 'active' : ''}`}
             onClick={() => update('style', 'minimal')}
           >
-            简约
+            {t('minimal')}
           </button>
         </div>
       </div>
 
       <div className="config-section">
-        <h3>尺寸参数</h3>
+        <h3>{t('dimensions')}</h3>
         <div className="field">
           <label>
-            直径 <span className="range-value">{config.diameter}mm</span>
+            {t('diameter')} <span className="range-value">{config.diameter}mm</span>
           </label>
           <input
             type="range"
@@ -96,7 +109,7 @@ export default function ConfigPanel({
         </div>
         <div className="field">
           <label>
-            厚度 <span className="range-value">{config.thickness}mm</span>
+            {t('thickness')} <span className="range-value">{config.thickness}mm</span>
           </label>
           <input
             type="range"
@@ -109,7 +122,7 @@ export default function ConfigPanel({
         </div>
         <div className="field">
           <label>
-            文字深度 <span className="range-value">{config.textDepth}mm</span>
+            {t('textDepth')} <span className="range-value">{config.textDepth}mm</span>
           </label>
           <input
             type="range"
@@ -124,7 +137,7 @@ export default function ConfigPanel({
           <>
             <div className="field">
               <label>
-                凹槽数量 <span className="range-value">{config.grooveCount}</span>
+                {t('grooveCount')} <span className="range-value">{config.grooveCount}</span>
               </label>
               <input
                 type="range"
@@ -137,7 +150,7 @@ export default function ConfigPanel({
             </div>
             <div className="field">
               <label>
-                凹槽半径 <span className="range-value">{config.grooveRadius}mm</span>
+                {t('grooveRadius')} <span className="range-value">{config.grooveRadius}mm</span>
               </label>
               <input
                 type="range"
@@ -152,7 +165,7 @@ export default function ConfigPanel({
         )}
         <div className="field">
           <label>
-            边框环宽度 <span className="range-value">{config.rimWidth}mm</span>
+            {t('rimWidth')} <span className="range-value">{config.rimWidth}mm</span>
           </label>
           <input
             type="range"
@@ -166,14 +179,14 @@ export default function ConfigPanel({
       </div>
 
       <div className="config-section">
-        <h3>颜色配置</h3>
+        <h3>{t('colors')}</h3>
         <div className="color-grid">
-          {COLOR_PARTS.map(({ key, label }) => {
+          {COLOR_PARTS.map((key) => {
             if (key === 'grooves' && config.style !== 'classic') return null
             return (
               <ColorPicker
                 key={key}
-                label={label}
+                label={t(key)}
                 color={config.colors[key]}
                 onChange={(color) => updateColor(key, color)}
               />
@@ -183,63 +196,59 @@ export default function ConfigPanel({
       </div>
 
       <div className="config-section">
-        <h3>字体</h3>
+        <h3>{t('font')}</h3>
         <div className="font-selector">
           <span className="font-name">
             {config.fontPath
               ? config.fontPath.split('/').pop()
-              : 'Noto Sans SC（内置）'}
+              : t('builtInFont')}
           </span>
           <button className="btn btn-secondary" onClick={handleSelectFont}>
-            选择
+            {t('choose')}
           </button>
           {config.fontPath && (
             <button
               className="btn btn-secondary"
               onClick={() => update('fontPath', null)}
             >
-              重置
+              {t('reset')}
             </button>
           )}
         </div>
       </div>
 
       <div className="config-section">
-        <h3>输出目录</h3>
+        <h3>{t('outputDir')}</h3>
         <div className="font-selector">
           <span className="font-name">
-            {exportDir || '未设置，首次导出时会提示选择'}
+            {exportDir || t('exportDirUnset')}
           </span>
           <button className="btn btn-secondary" onClick={onSelectExportDir}>
-            选择
+            {t('choose')}
           </button>
         </div>
-        <div className="export-hint">
-          选择一次后会自动记住，后续导出不再重复询问
-        </div>
+        <div className="export-hint">{t('exportDirHint')}</div>
       </div>
 
       <div className="config-section">
-        <h3>导出</h3>
+        <h3>{t('export')}</h3>
         <div className="export-buttons">
           <button
             className="btn btn-primary"
             disabled={exporting}
             onClick={() => onExport('multi')}
           >
-            导出 3MF + STL（多色打印）
+            {t('exportMulti')}
           </button>
           <button
             className="btn btn-secondary"
             disabled={exporting}
             onClick={() => onExport('single')}
           >
-            导出合体 STL（单色打印）
+            {t('exportSingle')}
           </button>
         </div>
-        <div className="export-hint">
-          3MF 文件可直接导入 Bambu Studio，自带颜色分配
-        </div>
+        <div className="export-hint">{t('exportHint')}</div>
         {progress && (
           <div>
             <div className="progress-bar">
@@ -249,10 +258,10 @@ export default function ConfigPanel({
               />
             </div>
             <div className="progress-text">
-              {progress.stage === 'generating' && '生成几何体...'}
-              {progress.stage === 'exporting' && `导出 ${progress.file || ''}...`}
-              {progress.stage === 'combining' && '生成合体版...'}
-              {progress.stage === 'done' && '完成！'}
+              {progress.stage === 'generating' && t('generating')}
+              {progress.stage === 'exporting' && t('exportingFile', { file: progress.file || '' })}
+              {progress.stage === 'combining' && t('combining')}
+              {progress.stage === 'done' && t('done')}
             </div>
           </div>
         )}

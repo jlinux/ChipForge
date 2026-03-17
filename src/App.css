@@ -27,6 +27,13 @@ body {
   padding: 20px;
 }
 
+.panel-header {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
 .preview {
   flex: 1;
   height: 100vh;
@@ -249,8 +256,12 @@ body {
   font-size: 18px;
   font-weight: 700;
   color: #ecf0f1;
-  margin-bottom: 20px;
   text-align: center;
+}
+
+.lang-toggle .style-btn {
+  padding: 6px 8px;
+  font-size: 12px;
 }
 
 /* Scrollbar */

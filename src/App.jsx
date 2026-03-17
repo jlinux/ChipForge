@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import ConfigPanel from './components/ConfigPanel'
 import ChipPreview from './components/ChipPreview'
+import { createTranslator } from './i18n'
 
 const DEFAULT_CONFIG = {
   name: 'Player',
@@ -27,11 +28,25 @@ export default function App() {
   const [exporting, setExporting] = useState(false)
   const [progress, setProgress] = useState(null)
   const [exportDir, setExportDir] = useState(null)
+  const [locale, setLocale] = useState('en')
+  const t = createTranslator(locale)
 
   useEffect(() => {
+    const savedLocale = window.localStorage.getItem('chipforge-locale')
+    if (savedLocale === 'zh-CN' || savedLocale === 'en') {
+      setLocale(savedLocale)
+    } else if (navigator.language.toLowerCase().startsWith('zh')) {
+      setLocale('zh-CN')
+    }
+
     if (!window.electronAPI?.getExportDir) return
     window.electronAPI.getExportDir().then(setExportDir).catch(() => {})
   }, [])
+
+  const handleLocaleChange = (nextLocale) => {
+    setLocale(nextLocale)
+    window.localStorage.setItem('chipforge-locale', nextLocale)
+  }
 
   const handleSelectExportDir = async () => {
     if (!window.electronAPI?.selectExportDir) return
@@ -41,7 +56,7 @@ export default function App() {
 
   const handleExport = async (mode) => {
     if (!window.electronAPI) {
-      alert('STL 导出仅在 Electron 环境中可用')
+      alert(t('electronOnly'))
       return
     }
     setExporting(true)
@@ -56,12 +71,12 @@ export default function App() {
       })
       if (result.success) {
         setExportDir(result.outputDir)
-        alert(`导出成功！\n保存位置：${result.outputDir}`)
+        alert(t('exportSuccess', { outputDir: result.outputDir }))
       } else if (result.reason !== 'canceled') {
-        alert(`导出失败：${result.reason}`)
+        alert(t('exportFailed', { reason: result.reason }))
       }
     } catch (err) {
-      alert(`导出错误：${err.message}`)
+      alert(t('exportError', { message: err.message }))
     } finally {
       setExporting(false)
       setProgress(null)
@@ -75,6 +90,9 @@ export default function App() {
           config={config}
           onChange={setConfig}
           onExport={handleExport}
+          locale={locale}
+          onLocaleChange={handleLocaleChange}
+          t={t}
           exportDir={exportDir}
           onSelectExportDir={handleSelectExportDir}
           exporting={exporting}
