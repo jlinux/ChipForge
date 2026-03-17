@@ -5,9 +5,11 @@ const AdmZip = require('adm-zip')
 
 const DEFAULT_FONT_PATH = path.join(__dirname, '../fonts/NotoSansSC-Regular.ttf')
 
-// Parts overlap the body by 0.2mm so slicers can do proper boolean subtraction.
-// This is the standard approach for multi-color 3D printing (avoids non-manifold gaps).
-const OVERLAP = 0.2
+// Tiny gap (1µm) between colored parts and body to eliminate shared faces/edges.
+// Each part sits just outside the body surface — no mesh intersection, no shared
+// faces → zero non-manifold edges. The gap is invisible at FDM resolution
+// (layer height 100–300µm, nozzle 400µm).
+const GAP = 0.001
 
 // ─── Binary STL writer ──────────────────────────────────────────────
 // Normal is computed from (v1-v0)×(v2-v0) — so CCW winding = outward normal.
@@ -567,27 +569,27 @@ async function generateSTLFiles(params, outputDir, onProgress) {
   onProgress?.({ stage: 'generating', percent: 10, detail: '主体' })
   parts.body = solidCylinder(R, -halfT, halfT, SEG)
 
-  // 2. Name text: protrudes from top face (+Z), overlaps body by OVERLAP
+  // 2. Name text: sits on top face (+Z) with GAP separation from body
   onProgress?.({ stage: 'generating', percent: 25, detail: '正面文字' })
   const fontFile = fontPath || DEFAULT_FONT_PATH
   if (name) {
     const rawText = generateTextTriangles(name, fontFile, R * 0.4, textDepth)
     if (rawText.length > 0) {
-      parts.nameText = translate(rawText, 0, 0, halfT - OVERLAP)
+      parts.nameText = translate(rawText, 0, 0, halfT + GAP)
     }
   }
 
-  // 3. Value text: protrudes from bottom face (-Z), overlaps body by OVERLAP
+  // 3. Value text: sits on bottom face (-Z) with GAP separation from body
   onProgress?.({ stage: 'generating', percent: 40, detail: '背面文字' })
   if (value) {
     const rawVal = generateTextTriangles(value, fontFile, R * 0.5, textDepth)
     if (rawVal.length > 0) {
       const flipped = rotateY180(rawVal)
-      parts.valueText = translate(flipped, 0, 0, -halfT + OVERLAP)
+      parts.valueText = translate(flipped, 0, 0, -halfT - GAP)
     }
   }
 
-  // 4. Grooves / edge spots (classic style) — overlap body by OVERLAP
+  // 4. Grooves / edge spots (classic style) — sit outside body edge with GAP
   if (style === 'classic' && grooveCount > 0) {
     onProgress?.({ stage: 'generating', percent: 55, detail: '边缘凹槽' })
     const spotTris = []
@@ -595,18 +597,18 @@ async function generateSTLFiles(params, outputDir, onProgress) {
     const protrudeDepth = grooveRadius * 0.6
     for (let i = 0; i < grooveCount; i++) {
       const angle = (i / grooveCount) * 2 * Math.PI
-      spotTris.push(...solidEdgeSpot(angle, angWidth, R - OVERLAP, protrudeDepth + OVERLAP, -halfT, halfT, 4))
+      spotTris.push(...solidEdgeSpot(angle, angWidth, R + GAP, protrudeDepth, -halfT, halfT, 4))
     }
     parts.grooves = spotTris
   }
 
-  // 5. Rim rings: protrude from top & bottom, overlap body by OVERLAP
+  // 5. Rim rings: sit on top & bottom faces with GAP separation from body
   onProgress?.({ stage: 'generating', percent: 70, detail: '边框环' })
   const rimOuter = R - 0.5
   const rimInner = rimOuter - rimWidth
   if (rimInner > 0) {
-    const topRim = solidRing(rimOuter, rimInner, halfT - OVERLAP, halfT - OVERLAP + textDepth + OVERLAP, SEG)
-    const botRim = solidRing(rimOuter, rimInner, -(halfT - OVERLAP + textDepth + OVERLAP), -(halfT - OVERLAP), SEG)
+    const topRim = solidRing(rimOuter, rimInner, halfT + GAP, halfT + GAP + textDepth, SEG)
+    const botRim = solidRing(rimOuter, rimInner, -(halfT + GAP + textDepth), -(halfT + GAP), SEG)
     parts.rimRing = [...topRim, ...botRim]
   }
 
