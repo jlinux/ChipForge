@@ -9,7 +9,15 @@ const COLOR_PARTS = [
   { key: 'rimRing', label: '边框环' },
 ]
 
-export default function ConfigPanel({ config, onChange, onExport, exporting, progress }) {
+export default function ConfigPanel({
+  config,
+  onChange,
+  onExport,
+  exportDir,
+  onSelectExportDir,
+  exporting,
+  progress,
+}) {
   const update = (key, value) => {
     onChange({ ...config, [key]: value })
   }
@@ -193,6 +201,21 @@ export default function ConfigPanel({ config, onChange, onExport, exporting, pro
               重置
             </button>
           )}
+        </div>
+      </div>
+
+      <div className="config-section">
+        <h3>输出目录</h3>
+        <div className="font-selector">
+          <span className="font-name">
+            {exportDir || '未设置，首次导出时会提示选择'}
+          </span>
+          <button className="btn btn-secondary" onClick={onSelectExportDir}>
+            选择
+          </button>
+        </div>
+        <div className="export-hint">
+          选择一次后会自动记住，后续导出不再重复询问
         </div>
       </div>
 

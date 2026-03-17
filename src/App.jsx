@@ -1,4 +1,4 @@
-import React, { useState } from 'react'
+import React, { useEffect, useState } from 'react'
 import ConfigPanel from './components/ConfigPanel'
 import ChipPreview from './components/ChipPreview'
 
@@ -26,6 +26,18 @@ export default function App() {
   const [config, setConfig] = useState(DEFAULT_CONFIG)
   const [exporting, setExporting] = useState(false)
   const [progress, setProgress] = useState(null)
+  const [exportDir, setExportDir] = useState(null)
+
+  useEffect(() => {
+    if (!window.electronAPI?.getExportDir) return
+    window.electronAPI.getExportDir().then(setExportDir).catch(() => {})
+  }, [])
+
+  const handleSelectExportDir = async () => {
+    if (!window.electronAPI?.selectExportDir) return
+    const dir = await window.electronAPI.selectExportDir()
+    if (dir) setExportDir(dir)
+  }
 
   const handleExport = async (mode) => {
     if (!window.electronAPI) {
@@ -43,6 +55,7 @@ export default function App() {
         exportMode: mode,
       })
       if (result.success) {
+        setExportDir(result.outputDir)
         alert(`导出成功！\n保存位置：${result.outputDir}`)
       } else if (result.reason !== 'canceled') {
         alert(`导出失败：${result.reason}`)
@@ -62,6 +75,8 @@ export default function App() {
           config={config}
           onChange={setConfig}
           onExport={handleExport}
+          exportDir={exportDir}
+          onSelectExportDir={handleSelectExportDir}
           exporting={exporting}
           progress={progress}
         />
