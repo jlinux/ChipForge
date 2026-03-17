@@ -3,3 +3,5 @@ dist/
 dist-electron/
 *.log
 .DS_Store
+# BambuStudio source reference (large file, local only)
+docs/bambu-studio-reference/bbs_3mf.cpp

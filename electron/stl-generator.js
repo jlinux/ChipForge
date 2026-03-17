@@ -383,30 +383,27 @@ function rotateY180(tris) {
 /**
  * Generate a 3MF file for Bambu Studio multi-color printing.
  *
- * Structure: each part is a SEPARATE <object> with its own mesh.
- * A parent object assembles them via <components>.
- * Bambu Studio shows each component as a distinct part with its own
- * filament/color assignment.
+ * Color mechanism: uses <m:colorgroup> + <m:color> (material extension namespace).
+ * BambuStudio recognizes colors via the generic 3MF path (m_is_bbl_3mf = false):
+ * - Each child <object> has pid/pindex pointing to a colorgroup entry
+ * - BBS maps distinct colors to distinct extruder IDs automatically
+ * - model_settings.config is kept as a bonus (loaded regardless of m_is_bbl_3mf)
  *
- * This avoids non-manifold issues (each mesh is independently valid)
- * and enables per-part color in Bambu Studio.
+ * IMPORTANT: Do NOT set Application metadata to "BambuStudio-*" — that triggers
+ * m_is_bbl_3mf=true which SKIPS per-triangle/per-object color processing.
  */
 function write3MF(partsWithColors, outputPath) {
-  let nextId = 1
-
-  // Material definitions
-  const matId = nextId++
-  const matEntries = partsWithColors.map((p, i) =>
-    `      <base name="${escXml(p.name)}" displaycolor="${p.color}" />`
-  ).join('\n')
-
-  // Build each part as a separate object
+  // ── Build per-part mesh objects ──
+  const childIds = []
   const objectXmls = []
   const componentRefs = []
+  // colorgroup id for the m:colorgroup element
+  const colorGroupId = 100
 
   for (let pi = 0; pi < partsWithColors.length; pi++) {
     const part = partsWithColors[pi]
-    const objId = nextId++
+    const objId = pi + 1
+    childIds.push(objId)
 
     // Deduplicate vertices within this part
     const verts = []
@@ -434,12 +431,8 @@ function write3MF(partsWithColors, outputPath) {
       `          <triangle v1="${t.v1}" v2="${t.v2}" v3="${t.v3}" />`
     ).join('\n')
 
-    // Each child object gets slic3rpe:extruder metadata for Bambu Studio color assignment.
-    // Extruder numbers are 1-based (filament slot 1, 2, 3, ...).
-    const extruderNum = pi + 1
-    objectXmls.push(`    <object id="${objId}" type="model" pid="${matId}" pindex="${pi}">
-      <metadata name="slic3rpe:extruder" value="${extruderNum}" />
-      <metadata name="slic3rpe:name" value="${escXml(part.name)}" />
+    // Each child object references colorgroup via pid/pindex
+    objectXmls.push(`    <object id="${objId}" type="model" pid="${colorGroupId}" pindex="${pi}">
       <mesh>
         <vertices>
 ${vertXml}
@@ -450,25 +443,34 @@ ${triXml}
       </mesh>
     </object>`)
 
-    componentRefs.push(`        <component objectid="${objId}" />`)
+    componentRefs.push(`        <component objectid="${objId}" transform="1 0 0 0 1 0 0 0 1 0 0 0" />`)
   }
 
-  // Parent object that groups all parts
-  const parentId = nextId++
+  // Parent object that groups all parts via components
+  const parentId = partsWithColors.length + 1
   objectXmls.push(`    <object id="${parentId}" type="model">
       <components>
 ${componentRefs.join('\n')}
       </components>
     </object>`)
 
+  // m:colorgroup entries — BambuStudio uses these for the generic 3MF color path
+  const colorEntries = partsWithColors.map(p =>
+    `      <m:color color="${p.color}" />`
+  ).join('\n')
+
+  // ── 3D/3dmodel.model ──
+  // Do NOT set Application to "BambuStudio-*" — that triggers m_is_bbl_3mf=true
+  // which skips per-object color processing (bbs_3mf.cpp line 3843).
+  // Instead, use <m:colorgroup> with material namespace for colors.
   const modelXml = `<?xml version="1.0" encoding="UTF-8"?>
 <model unit="millimeter" xml:lang="en-US"
   xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
-  xmlns:slic3rpe="http://schemas.slic3r.org/3mf/2017/06">
-  <resources>
-    <basematerials id="${matId}">
-${matEntries}
-    </basematerials>
+  xmlns:m="http://schemas.microsoft.com/3dmanufacturing/material/2015/02">
+ <resources>
+    <m:colorgroup id="${colorGroupId}">
+${colorEntries}
+    </m:colorgroup>
 ${objectXmls.join('\n')}
   </resources>
   <build>
@@ -476,10 +478,39 @@ ${objectXmls.join('\n')}
   </build>
 </model>`
 
+  // ── Metadata/model_settings.config — BambuStudio per-part extruder assignment ──
+  const partConfigs = childIds.map((cid, pi) => {
+    const part = partsWithColors[pi]
+    const extruder = pi + 1
+    return `  <part id="${cid}" subtype="normal_part">
+    <metadata key="name" value="${escXml(part.name)}"/>
+    <metadata key="matrix" value="1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1"/>
+    <metadata key="extruder" value="${extruder}"/>
+    <mesh_stat edges_fixed="0" degenerate_facets="0" facets_removed="0" facets_reversed="0" backwards_edges="0"/>
+  </part>`
+  }).join('\n')
+
+  const modelConfig = `<?xml version="1.0" encoding="UTF-8"?>
+<config>
+<object id="${parentId}">
+  <metadata key="name" value="Chip"/>
+  <metadata key="extruder" value="1"/>
+${partConfigs}
+</object>
+<plate>
+  <metadata key="plater_id" value="1"/>
+  <metadata key="locked" value="false"/>
+  <metadata key="object_id" value="${parentId}"/>
+  <metadata key="instance_id" value="0"/>
+</plate>
+</config>`
+
+  // ── Standard 3MF packaging ──
   const contentTypes = `<?xml version="1.0" encoding="UTF-8"?>
 <Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">
   <Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml" />
   <Default Extension="model" ContentType="application/vnd.ms-package.3dmanufacturing-3dmodel+xml" />
+  <Default Extension="config" ContentType="text/xml" />
 </Types>`
 
   const rels = `<?xml version="1.0" encoding="UTF-8"?>
@@ -491,6 +522,7 @@ ${objectXmls.join('\n')}
   zip.addFile('[Content_Types].xml', Buffer.from(contentTypes, 'utf-8'))
   zip.addFile('_rels/.rels', Buffer.from(rels, 'utf-8'))
   zip.addFile('3D/3dmodel.model', Buffer.from(modelXml, 'utf-8'))
+  zip.addFile('Metadata/model_settings.config', Buffer.from(modelConfig, 'utf-8'))
   zip.writeZip(outputPath)
 }
 
