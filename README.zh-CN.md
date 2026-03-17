@@ -94,14 +94,19 @@ docs/
   bambu-studio-reference/
 ```
 
-## 开源发布建议
+## 致谢
 
-在正式开源前，建议你再补充：
+这个项目完全是在 **Claude Code** 和 **Codex** 的帮助下生成和迭代完成的。
 
-- `LICENSE`
-- 截图或演示 GIF
-- macOS / Windows 二进制发布包
-- 简短 roadmap 或 issue 标签体系
+感谢这两个工具在代码生成、几何建模逻辑、导出流程和文档整理方面提供的支持。
+
+## 开源协议
+
+本项目采用 **MIT License**，完全开源。
+
+版权所有 (c) 2026 Yong Tang
+
+详细内容见 [LICENSE](./LICENSE)。
 
 ## 仓库名建议
 

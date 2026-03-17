@@ -94,14 +94,19 @@ docs/
   bambu-studio-reference/
 ```
 
-## Open Source Release Notes
+## Acknowledgements
 
-Before publishing the repository, you may still want to add:
+This project was created entirely with the help of **Claude Code** and **Codex**.
 
-- a `LICENSE` file
-- screenshots or a demo GIF
-- release binaries for macOS / Windows
-- a short roadmap or issue labels
+Many thanks to both tools for helping generate, iterate on, and refine the code, geometry logic, export pipeline, and documentation for this project.
+
+## License
+
+This project is fully open source under the **MIT License**.
+
+Copyright (c) 2026 Yong Tang
+
+See [LICENSE](./LICENSE) for details.
 
 ## Suggested Repository Name
 
@@ -112,4 +117,3 @@ Alternative names if you want a different tone:
 - `chipsmith`
 - `pokermint`
 - `stackforge`
-
