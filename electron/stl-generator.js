@@ -200,8 +200,15 @@ function generateTextTriangles(text, fontFilePath, fontSize, depth) {
   const triangles = []
   for (const poly of polygons) {
     // Transform: center and flip Y
-    const outer = poly.outer.map(p => ({ x: p.x - cx, y: -(p.y - cy) }))
-    const holes = poly.holes.map(h => h.map(p => ({ x: p.x - cx, y: -(p.y - cy) })))
+    const outerRaw = poly.outer.map(p => ({ x: p.x - cx, y: -(p.y - cy) }))
+    const holesRaw = poly.holes.map(h => h.map(p => ({ x: p.x - cx, y: -(p.y - cy) })))
+
+    // Flipping Y reverses contour winding. Normalize here so:
+    // - outer contour is CCW
+    // - hole contours are CW
+    // The wall builders below rely on that convention for outward normals.
+    const outer = signedArea(outerRaw) >= 0 ? outerRaw : [...outerRaw].reverse()
+    const holes = holesRaw.map(hole => signedArea(hole) <= 0 ? hole : [...hole].reverse())
 
     // Use earcut for robust triangulation
     const tris2D = triangulatePoly(outer, holes)
@@ -235,15 +242,13 @@ function generateTextTriangles(text, fontFilePath, fontSize, depth) {
 /**
  * Side walls for an OUTER contour (assumed CCW).
  * For each edge p0→p1, the exterior is on the RIGHT side.
- * Wall quad: viewed from the right (exterior), vertices wind CCW.
+ * Wall quad is wound so shared edges oppose the top/bottom caps.
  */
 function addOuterWalls(tris, pts, z0, z1) {
   for (let i = 0; i < pts.length; i++) {
     const p0 = pts[i], p1 = pts[(i + 1) % pts.length]
-    // Viewed from exterior (right of edge direction):
-    // bottom-start, bottom-end, top-end, top-start = CCW
-    tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p0.x, y: p0.y, z: z1 }, { x: p1.x, y: p1.y, z: z1 }])
-    tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }, { x: p1.x, y: p1.y, z: z0 }])
+    tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p1.x, y: p1.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }])
+    tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }, { x: p0.x, y: p0.y, z: z1 }])
   }
 }
 
@@ -254,9 +259,8 @@ function addOuterWalls(tris, pts, z0, z1) {
 function addHoleWalls(tris, pts, z0, z1) {
   for (let i = 0; i < pts.length; i++) {
     const p0 = pts[i], p1 = pts[(i + 1) % pts.length]
-    // Reversed compared to outer walls
-    tris.push([{ x: p1.x, y: p1.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }, { x: p0.x, y: p0.y, z: z1 }])
-    tris.push([{ x: p1.x, y: p1.y, z: z0 }, { x: p0.x, y: p0.y, z: z1 }, { x: p0.x, y: p0.y, z: z0 }])
+    tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p1.x, y: p1.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }])
+    tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }, { x: p0.x, y: p0.y, z: z1 }])
   }
 }
 
@@ -340,6 +344,11 @@ function commandsToPolygons(commands) {
     }
   }
 
+  // Simplify contours to avoid sliver triangles from near-duplicate / near-collinear points.
+  for (let i = 0; i < contours.length; i++) {
+    contours[i] = simplifyContour(contours[i])
+  }
+
   // Classify by signed area
   const polys = []
   for (const c of contours) {
@@ -351,6 +360,62 @@ function commandsToPolygons(commands) {
     }
   }
   return polys
+}
+
+function simplifyContour(points) {
+  if (points.length <= 3) return points
+
+  const DIST_EPS = 1e-4
+  const DIST_EPS2 = DIST_EPS * DIST_EPS
+
+  let pts = []
+  for (const p of points) {
+    const prev = pts[pts.length - 1]
+    if (!prev || distSq(prev, p) > DIST_EPS2) pts.push(p)
+  }
+
+  if (pts.length > 1 && distSq(pts[0], pts[pts.length - 1]) <= DIST_EPS2) {
+    pts.pop()
+  }
+
+  let changed = true
+  while (changed && pts.length > 3) {
+    changed = false
+    const nextPts = []
+
+    for (let i = 0; i < pts.length; i++) {
+      const prev = pts[(i - 1 + pts.length) % pts.length]
+      const cur = pts[i]
+      const next = pts[(i + 1) % pts.length]
+
+      if (distSq(prev, cur) <= DIST_EPS2 || distSq(cur, next) <= DIST_EPS2) {
+        changed = true
+        continue
+      }
+
+      const base = Math.hypot(next.x - prev.x, next.y - prev.y)
+      const cross = Math.abs((cur.x - prev.x) * (next.y - prev.y) - (cur.y - prev.y) * (next.x - prev.x))
+      const height = base > 0 ? cross / base : 0
+
+      if (height < DIST_EPS) {
+        changed = true
+        continue
+      }
+
+      nextPts.push(cur)
+    }
+
+    if (nextPts.length < 3) break
+    pts = nextPts
+  }
+
+  return pts
+}
+
+function distSq(a, b) {
+  const dx = a.x - b.x
+  const dy = a.y - b.y
+  return dx * dx + dy * dy
 }
 
 function signedArea(pts) {
