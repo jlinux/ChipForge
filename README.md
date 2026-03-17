@@ -1,12 +1,10 @@
 # ChipForge
 
+[中文说明](./README.zh-CN.md)
+
 **ChipForge** is a desktop generator for custom Texas Hold'em poker chips designed for multi-color 3D printing.
 
-**ChipForge** 是一个面向多色 3D 打印的德州扑克筹码桌面生成器。
-
 It lets you customize chip text, size, colors, style, edge details, and font, then export ready-to-slice `3MF` and `STL` files.
-
-你可以自定义筹码文字、尺寸、颜色、风格、边缘细节和字体，并导出可直接切片的 `3MF` / `STL` 文件。
 
 ## Why This Project
 
@@ -17,14 +15,6 @@ ChipForge focuses on the practical side:
 - `3MF` export tuned for Bambu Studio workflows
 - Manifold-friendly geometry for text, rim rings, and classic edge markers
 - Live 3D preview before export
-
-很多筹码设计工具更偏向视觉效果，但不一定适合真正打印。
-ChipForge 的重点是“能设计，也能真正打出来”：
-
-- 面向多色打印的多部件筹码生成
-- 针对 Bambu Studio 工作流优化的 `3MF` 导出
-- 更适合切片器处理的流形几何
-- 导出前可实时 3D 预览
 
 ## Features
 
@@ -103,35 +93,6 @@ fonts/
 docs/
   bambu-studio-reference/
 ```
-
-## Chinese Introduction
-
-ChipForge 是一个针对德州扑克筹码定制和 3D 打印导出的桌面工具。项目的目标不是只做一个“好看的建模演示”，而是尽量生成能被切片软件正确识别、正确分色、并可实际打印的模型文件。
-
-当前项目支持：
-
-- 经典 / 简约两种筹码风格
-- 正面姓名、背面面值文字
-- 主体、文字、边缘细节、边框环多部件配色
-- 经典边缘圆柱嵌入式结构
-- `3MF + STL` 导出
-- 与 Bambu Studio 多色工作流兼容的导出策略
-
-如果你想自己定制一批可打印的筹码，或者想研究多部件 3MF 导出与切片器兼容性，这个项目就是为这个场景写的。
-
-## English Introduction
-
-ChipForge is a desktop tool for designing and exporting custom poker chips for 3D printing.
-It is built with practical manufacturing constraints in mind rather than just visual mockups.
-
-The project aims to generate chip models that are:
-
-- customizable
-- previewable in real time
-- slicer-friendly
-- suitable for multi-color print workflows
-
-If you want to produce printable personalized chips, or study how multi-part `3MF` export works in real slicer pipelines, this project is built for that use case.
 
 ## Open Source Release Notes
 
