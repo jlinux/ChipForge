@@ -2,6 +2,7 @@ const fs = require('fs')
 const path = require('path')
 const earcut = require('earcut')
 const AdmZip = require('adm-zip')
+const { normalizeLocale, t } = require('./i18n')
 
 const DEFAULT_FONT_PATH = path.join(__dirname, '../fonts/NotoSansSC-Regular.ttf')
 
@@ -669,7 +670,9 @@ async function generateSTLFiles(params, outputDir, onProgress) {
     style = 'classic',
     fontPath,
     colors = {},
+    locale = 'en',
   } = params
+  const currentLocale = normalizeLocale(locale)
 
   const R = diameter / 2
   const halfT = thickness / 2
@@ -682,7 +685,7 @@ async function generateSTLFiles(params, outputDir, onProgress) {
   const parts = {}
 
   // 1. Body
-  onProgress?.({ stage: 'generating', percent: 10, detail: '主体' })
+  onProgress?.({ stage: 'generating', percent: 10, detail: t(currentLocale, 'body') })
   if (style === 'classic' && grooveCount > 0) {
     const bodyProfile = createClassicBodyProfile(R, grooveCount, grooveRadius + GAP, 24, 16)
     parts.body = bodyProfile ? extrudePolygon(bodyProfile, -halfT, halfT) : solidCylinder(R, -halfT, halfT, SEG)
@@ -691,7 +694,7 @@ async function generateSTLFiles(params, outputDir, onProgress) {
   }
 
   // 2. Name text: sits on top face (+Z) with GAP separation from body
-  onProgress?.({ stage: 'generating', percent: 25, detail: '正面文字' })
+  onProgress?.({ stage: 'generating', percent: 25, detail: t(currentLocale, 'nameText') })
   const fontFile = fontPath || DEFAULT_FONT_PATH
   if (name) {
     const rawText = generateTextTriangles(name, fontFile, R * 0.4, textDepth)
@@ -701,7 +704,7 @@ async function generateSTLFiles(params, outputDir, onProgress) {
   }
 
   // 3. Value text: sits on bottom face (-Z) with GAP separation from body
-  onProgress?.({ stage: 'generating', percent: 40, detail: '背面文字' })
+  onProgress?.({ stage: 'generating', percent: 40, detail: t(currentLocale, 'valueText') })
   if (value) {
     const rawVal = generateTextTriangles(value, fontFile, R * 0.5, textDepth)
     if (rawVal.length > 0) {
@@ -712,7 +715,7 @@ async function generateSTLFiles(params, outputDir, onProgress) {
 
   // 4. Grooves / full round edge cylinders (classic style)
   if (style === 'classic' && grooveCount > 0) {
-    onProgress?.({ stage: 'generating', percent: 55, detail: '边缘凹槽' })
+    onProgress?.({ stage: 'generating', percent: 55, detail: t(currentLocale, 'grooves') })
     const spotTris = []
     const centerRadius = getGrooveCenterRadius(R, grooveRadius)
     for (let i = 0; i < grooveCount; i++) {
@@ -723,7 +726,7 @@ async function generateSTLFiles(params, outputDir, onProgress) {
   }
 
   // 5. Rim rings: sit on top & bottom faces with GAP separation from body
-  onProgress?.({ stage: 'generating', percent: 70, detail: '边框环' })
+  onProgress?.({ stage: 'generating', percent: 70, detail: t(currentLocale, 'rimRing') })
   const rimOuter = R - 0.5
   const rimInner = rimOuter - rimWidth
   if (rimInner > 0) {
@@ -742,11 +745,11 @@ async function generateSTLFiles(params, outputDir, onProgress) {
     rimRing: '#F39C12',
   }
   const partLabels = {
-    body: '主体',
-    nameText: '正面文字',
-    valueText: '背面文字',
-    grooves: '边缘凹槽',
-    rimRing: '边框环',
+    body: t(currentLocale, 'body'),
+    nameText: t(currentLocale, 'nameText'),
+    valueText: t(currentLocale, 'valueText'),
+    grooves: t(currentLocale, 'grooves'),
+    rimRing: t(currentLocale, 'rimRing'),
   }
 
   const partsWithColors = []

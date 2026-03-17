@@ -28,7 +28,7 @@ export default function ConfigPanel({
 
   const handleSelectFont = async () => {
     if (!window.electronAPI) return
-    const fontPath = await window.electronAPI.selectFont()
+    const fontPath = await window.electronAPI.selectFont(locale)
     if (fontPath) update('fontPath', fontPath)
   }
 
@@ -258,7 +258,11 @@ export default function ConfigPanel({
               />
             </div>
             <div className="progress-text">
-              {progress.stage === 'generating' && t('generating')}
+              {progress.stage === 'generating' && (
+                progress.detail
+                  ? t('generatingDetail', { detail: progress.detail })
+                  : t('generating')
+              )}
               {progress.stage === 'exporting' && t('exportingFile', { file: progress.file || '' })}
               {progress.stage === 'combining' && t('combining')}
               {progress.stage === 'done' && t('done')}

@@ -1,11 +1,12 @@
-import React, { useMemo } from 'react'
+import React, { useEffect, useMemo, useState } from 'react'
 import { Canvas } from '@react-three/fiber'
 import { OrbitControls, Environment } from '@react-three/drei'
 import { generateChipGeometries } from '../utils/chip-geometry'
+import builtInFontUrl from '../../fonts/NotoSansSC-Regular.ttf?url'
 
-function ChipModel({ config }) {
+function ChipModel({ config, fontData }) {
   const parts = useMemo(() => {
-    return generateChipGeometries(config)
+    return generateChipGeometries(config, fontData)
   }, [
     config.name,
     config.value,
@@ -16,6 +17,8 @@ function ChipModel({ config }) {
     config.grooveCount,
     config.grooveRadius,
     config.rimWidth,
+    config.fontPath,
+    fontData,
   ])
 
   return (
@@ -50,7 +53,44 @@ function ChipModel({ config }) {
 }
 
 export default function ChipPreview({ config }) {
+  const [fontData, setFontData] = useState(null)
   const cameraDistance = config.diameter * 1.5
+
+  useEffect(() => {
+    let active = true
+
+    async function loadFont() {
+      try {
+        let data
+        if (config.fontPath && window.electronAPI?.readFontData) {
+          data = await window.electronAPI.readFontData(config.fontPath)
+        } else {
+          const response = await fetch(builtInFontUrl)
+          data = await response.arrayBuffer()
+        }
+
+        if (!active) return
+
+        if (data instanceof ArrayBuffer) {
+          setFontData(data)
+        } else if (ArrayBuffer.isView(data)) {
+          const view = data
+          setFontData(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength))
+        } else if (data?.type === 'Buffer' && Array.isArray(data.data)) {
+          setFontData(Uint8Array.from(data.data).buffer)
+        } else {
+          setFontData(null)
+        }
+      } catch {
+        if (active) setFontData(null)
+      }
+    }
+
+    loadFont()
+    return () => {
+      active = false
+    }
+  }, [config.fontPath])
 
   return (
     <Canvas
@@ -62,7 +102,7 @@ export default function ChipPreview({ config }) {
       <pointLight position={[-30, -20, 40]} intensity={0.5} />
       <directionalLight position={[0, 30, 0]} intensity={0.6} />
 
-      <ChipModel config={config} />
+      <ChipModel config={config} fontData={fontData} />
 
       <OrbitControls
         enablePan={true}

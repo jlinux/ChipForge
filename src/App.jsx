@@ -50,7 +50,7 @@ export default function App() {
 
   const handleSelectExportDir = async () => {
     if (!window.electronAPI?.selectExportDir) return
-    const dir = await window.electronAPI.selectExportDir()
+    const dir = await window.electronAPI.selectExportDir(locale)
     if (dir) setExportDir(dir)
   }
 
@@ -67,6 +67,7 @@ export default function App() {
     try {
       const result = await window.electronAPI.generateSTL({
         ...config,
+        locale,
         exportMode: mode,
       })
       if (result.success) {

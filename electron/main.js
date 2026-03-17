@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, dialog } = require('electron')
 const fs = require('fs')
 const path = require('path')
 const { generateSTLFiles } = require('./stl-generator')
+const { normalizeLocale, t } = require('./i18n')
 
 let mainWindow
 let settings = {
@@ -37,9 +38,9 @@ function isValidDirectory(dirPath) {
   }
 }
 
-async function selectExportDirectory() {
+async function selectExportDirectory(locale = 'en') {
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: '选择保存位置',
+    title: t(locale, 'selectSaveLocation'),
     properties: ['openDirectory', 'createDirectory'],
   })
   if (result.canceled) return null
@@ -81,14 +82,19 @@ app.on('activate', () => {
 })
 
 // IPC: Select font file
-ipcMain.handle('select-font', async () => {
+ipcMain.handle('select-font', async (event, locale) => {
+  const currentLocale = normalizeLocale(locale)
   const result = await dialog.showOpenDialog(mainWindow, {
-    title: '选择字体文件',
-    filters: [{ name: '字体文件', extensions: ['ttf', 'otf', 'woff'] }],
+    title: t(currentLocale, 'selectFontFile'),
+    filters: [{ name: t(currentLocale, 'fontFiles'), extensions: ['ttf', 'otf', 'woff'] }],
     properties: ['openFile'],
   })
   if (result.canceled) return null
   return result.filePaths[0]
+})
+
+ipcMain.handle('read-font-data', async (event, fontPath) => {
+  return fs.readFileSync(fontPath)
 })
 
 // IPC: Export directory
@@ -96,15 +102,16 @@ ipcMain.handle('get-export-dir', async () => {
   return isValidDirectory(settings.exportDir) ? settings.exportDir : null
 })
 
-ipcMain.handle('select-export-dir', async () => {
-  return selectExportDirectory()
+ipcMain.handle('select-export-dir', async (event, locale) => {
+  return selectExportDirectory(normalizeLocale(locale))
 })
 
 // IPC: Generate STL files
 ipcMain.handle('generate-stl', async (event, params) => {
+  const locale = normalizeLocale(params?.locale)
   let outputDir = settings.exportDir
   if (!isValidDirectory(outputDir)) {
-    outputDir = await selectExportDirectory()
+    outputDir = await selectExportDirectory(locale)
   }
   if (!outputDir) return { success: false, reason: 'canceled' }
 

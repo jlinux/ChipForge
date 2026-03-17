@@ -1,4 +1,6 @@
 import * as THREE from 'three'
+import earcut from 'earcut'
+import opentype from 'opentype.js'
 
 /**
  * Generate chip part geometries for 3D preview.
@@ -9,7 +11,7 @@ import * as THREE from 'three'
  *   - Text, rim ring protrude OUTWARD from the body surface
  *   - Grooves (classic) are full round cylinders embedded 2/3 into the edge
  */
-export function generateChipGeometries(config) {
+export function generateChipGeometries(config, fontData) {
   const {
     diameter = 40,
     thickness = 3.2,
@@ -36,14 +38,14 @@ export function generateChipGeometries(config) {
   }
 
   // 2. Name text (protrudes from top face, z = halfT to halfT + textDepth)
-  const nameParts = createTextPlaceholder(name, R * 0.35, textDepth)
+  const nameParts = createTextGeometry(name, R * 0.35, textDepth, fontData)
   if (nameParts) {
     nameParts.translate(0, 0, halfT) // bottom of extrusion at body surface
     parts.nameText = nameParts
   }
 
   // 3. Value text (protrudes from bottom face)
-  const valueParts = createTextPlaceholder(value, R * 0.45, textDepth)
+  const valueParts = createTextGeometry(value, R * 0.45, textDepth, fontData)
   if (valueParts) {
     valueParts.rotateY(Math.PI)
     valueParts.translate(0, 0, -halfT) // top of extrusion at body surface
@@ -96,41 +98,149 @@ export function generateChipGeometries(config) {
 }
 
 /**
- * Create a rounded-rect placeholder per character (for preview).
- * Extrusion goes from z=0 to z=depth.
+ * Create text geometry from a font outline for accurate preview.
  */
-function createTextPlaceholder(text, fontSize, depth) {
-  if (!text) return null
+function createTextGeometry(text, fontSize, depth, fontData) {
+  if (!text || !fontData) return null
 
-  const charWidth = fontSize * 0.65
-  const charHeight = fontSize
-  const totalWidth = text.length * charWidth
-  const startX = -totalWidth / 2
-
-  const shapes = []
-  for (let i = 0; i < text.length; i++) {
-    const x = startX + i * charWidth + charWidth * 0.1
-    const shape = createCharShape(x, -charHeight / 2, charWidth * 0.8, charHeight)
-    if (shape) shapes.push(shape)
+  let font
+  try {
+    font = opentype.parse(fontData)
+  } catch {
+    return null
   }
 
-  if (shapes.length === 0) return null
-  return new THREE.ExtrudeGeometry(shapes, { depth, bevelEnabled: false })
+  const otPath = font.getPath(text, 0, 0, fontSize)
+  const polygons = commandsToPolygons(otPath.commands || [])
+  if (polygons.length === 0) return null
+
+  let minX = Infinity
+  let maxX = -Infinity
+  let minY = Infinity
+  let maxY = -Infinity
+  for (const poly of polygons) {
+    for (const pts of [poly.outer, ...poly.holes]) {
+      for (const pt of pts) {
+        minX = Math.min(minX, pt.x)
+        maxX = Math.max(maxX, pt.x)
+        minY = Math.min(minY, pt.y)
+        maxY = Math.max(maxY, pt.y)
+      }
+    }
+  }
+
+  const cx = (minX + maxX) / 2
+  const cy = (minY + maxY) / 2
+  const geometries = []
+
+  for (const poly of polygons) {
+    const outerRaw = poly.outer.map((p) => ({ x: p.x - cx, y: -(p.y - cy) }))
+    const holesRaw = poly.holes.map((hole) => hole.map((p) => ({ x: p.x - cx, y: -(p.y - cy) })))
+    const outer = signedArea2D(outerRaw) >= 0 ? outerRaw : [...outerRaw].reverse()
+    const holes = holesRaw.map((hole) => (signedArea2D(hole) <= 0 ? hole : [...hole].reverse()))
+    const shape = polygonToShape(outer, holes)
+    if (!shape) continue
+    geometries.push(new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false }))
+  }
+
+  if (geometries.length === 0) return null
+  return mergeBufferGeometries(geometries)
 }
 
-function createCharShape(x, y, w, h) {
+function polygonToShape(outer, holes) {
+  if (!outer || outer.length < 3) return null
+
   const shape = new THREE.Shape()
-  const r = Math.min(w, h) * 0.08
-  shape.moveTo(x + r, y)
-  shape.lineTo(x + w - r, y)
-  shape.quadraticCurveTo(x + w, y, x + w, y + r)
-  shape.lineTo(x + w, y + h - r)
-  shape.quadraticCurveTo(x + w, y + h, x + w - r, y + h)
-  shape.lineTo(x + r, y + h)
-  shape.quadraticCurveTo(x, y + h, x, y + h - r)
-  shape.lineTo(x, y + r)
-  shape.quadraticCurveTo(x, y, x + r, y)
+  shape.moveTo(outer[0].x, outer[0].y)
+  for (let i = 1; i < outer.length; i++) {
+    shape.lineTo(outer[i].x, outer[i].y)
+  }
+  shape.closePath()
+
+  for (const hole of holes) {
+    if (!hole || hole.length < 3) continue
+    const path = new THREE.Path()
+    path.moveTo(hole[0].x, hole[0].y)
+    for (let i = 1; i < hole.length; i++) {
+      path.lineTo(hole[i].x, hole[i].y)
+    }
+    path.closePath()
+    shape.holes.push(path)
+  }
+
   return shape
+}
+
+function commandsToPolygons(commands) {
+  const contours = []
+  let cur = []
+
+  for (const c of commands) {
+    switch (c.type) {
+      case 'M':
+        if (cur.length > 2) contours.push(cur)
+        cur = [{ x: c.x, y: c.y }]
+        break
+      case 'L':
+        cur.push({ x: c.x, y: c.y })
+        break
+      case 'Q': {
+        const p = cur[cur.length - 1]
+        for (let t = 0.1; t <= 1.001; t += 0.1) {
+          const mt = 1 - t
+          cur.push({
+            x: mt * mt * p.x + 2 * mt * t * c.x1 + t * t * c.x,
+            y: mt * mt * p.y + 2 * mt * t * c.y1 + t * t * c.y,
+          })
+        }
+        break
+      }
+      case 'C': {
+        const p = cur[cur.length - 1]
+        for (let t = 0.1; t <= 1.001; t += 0.1) {
+          const mt = 1 - t
+          cur.push({
+            x: mt * mt * mt * p.x + 3 * mt * mt * t * c.x1 + 3 * mt * t * t * c.x2 + t * t * t * c.x,
+            y: mt * mt * mt * p.y + 3 * mt * mt * t * c.y1 + 3 * mt * t * t * c.y2 + t * t * t * c.y,
+          })
+        }
+        break
+      }
+      case 'Z':
+        if (cur.length > 2) contours.push(cur)
+        cur = []
+        break
+      default:
+        break
+    }
+  }
+
+  if (cur.length > 2) contours.push(cur)
+
+  for (const contour of contours) {
+    while (contour.length > 1) {
+      const first = contour[0]
+      const last = contour[contour.length - 1]
+      if (Math.abs(first.x - last.x) < 0.001 && Math.abs(first.y - last.y) < 0.001) contour.pop()
+      else break
+    }
+  }
+
+  for (let i = 0; i < contours.length; i++) {
+    contours[i] = simplifyContour(contours[i])
+  }
+
+  const polys = []
+  for (const contour of contours) {
+    const area = signedArea2D(contour)
+    if (area < 0) {
+      polys.push({ outer: contour, holes: [] })
+    } else if (area > 0 && polys.length > 0) {
+      polys[polys.length - 1].holes.push(contour)
+    }
+  }
+
+  return polys
 }
 
 /**
@@ -234,6 +344,56 @@ function distSq2D(a, b) {
   const dx = a.x - b.x
   const dy = a.y - b.y
   return dx * dx + dy * dy
+}
+
+function simplifyContour(points) {
+  if (points.length <= 3) return points
+
+  const DIST_EPS = 1e-4
+  const DIST_EPS2 = DIST_EPS * DIST_EPS
+  let pts = []
+
+  for (const p of points) {
+    const prev = pts[pts.length - 1]
+    if (!prev || distSq2D(prev, p) > DIST_EPS2) pts.push(p)
+  }
+
+  if (pts.length > 1 && distSq2D(pts[0], pts[pts.length - 1]) <= DIST_EPS2) {
+    pts.pop()
+  }
+
+  let changed = true
+  while (changed && pts.length > 3) {
+    changed = false
+    const nextPts = []
+
+    for (let i = 0; i < pts.length; i++) {
+      const prev = pts[(i - 1 + pts.length) % pts.length]
+      const cur = pts[i]
+      const next = pts[(i + 1) % pts.length]
+
+      if (distSq2D(prev, cur) <= DIST_EPS2 || distSq2D(cur, next) <= DIST_EPS2) {
+        changed = true
+        continue
+      }
+
+      const base = Math.hypot(next.x - prev.x, next.y - prev.y)
+      const cross = Math.abs((cur.x - prev.x) * (next.y - prev.y) - (cur.y - prev.y) * (next.x - prev.x))
+      const height = base > 0 ? cross / base : 0
+
+      if (height < DIST_EPS) {
+        changed = true
+        continue
+      }
+
+      nextPts.push(cur)
+    }
+
+    if (nextPts.length < 3) break
+    pts = nextPts
+  }
+
+  return pts
 }
 
 /**
