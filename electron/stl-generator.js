@@ -100,74 +100,15 @@ function solidRing(outerR, innerR, zBot, zTop, segments) {
 }
 
 /**
- * Groove "edge spot" — arc-shaped prism protruding outward from chip edge.
- * Closed manifold.
+ * Groove marker — full cylinder embedded into the body.
  */
-function solidEdgeSpot(angle, angularWidth, bodyRadius, protrudeDepth, zBot, zTop, arcSegments) {
-  const tris = []
-  const halfAng = angularWidth / 2
-  const r0 = bodyRadius
-  const r1 = bodyRadius + protrudeDepth
-
-  const steps = arcSegments
-  const angles = []
-  for (let s = 0; s <= steps; s++) {
-    angles.push(angle - halfAng + (s / steps) * angularWidth)
-  }
-
-  for (let s = 0; s < steps; s++) {
-    const a0 = angles[s], a1 = angles[s + 1]
-    const c0 = Math.cos(a0), s0_ = Math.sin(a0)
-    const c1 = Math.cos(a1), s1_ = Math.sin(a1)
-    const ix0 = c0 * r0, iy0 = s0_ * r0
-    const ix1 = c1 * r0, iy1 = s1_ * r0
-    const ox0 = c0 * r1, oy0 = s0_ * r1
-    const ox1 = c1 * r1, oy1 = s1_ * r1
-
-    // Top face (+Z)
-    tris.push([{ x: ix0, y: iy0, z: zTop }, { x: ox0, y: oy0, z: zTop }, { x: ox1, y: oy1, z: zTop }])
-    tris.push([{ x: ix0, y: iy0, z: zTop }, { x: ox1, y: oy1, z: zTop }, { x: ix1, y: iy1, z: zTop }])
-    // Bottom face (-Z)
-    tris.push([{ x: ox0, y: oy0, z: zBot }, { x: ix0, y: iy0, z: zBot }, { x: ix1, y: iy1, z: zBot }])
-    tris.push([{ x: ox0, y: oy0, z: zBot }, { x: ix1, y: iy1, z: zBot }, { x: ox1, y: oy1, z: zBot }])
-    // Outer wall — CCW from outside
-    tris.push([{ x: ox0, y: oy0, z: zTop }, { x: ox0, y: oy0, z: zBot }, { x: ox1, y: oy1, z: zBot }])
-    tris.push([{ x: ox0, y: oy0, z: zTop }, { x: ox1, y: oy1, z: zBot }, { x: ox1, y: oy1, z: zTop }])
-    // Inner wall — CCW from inside (toward center)
-    tris.push([{ x: ix0, y: iy0, z: zBot }, { x: ix0, y: iy0, z: zTop }, { x: ix1, y: iy1, z: zTop }])
-    tris.push([{ x: ix0, y: iy0, z: zBot }, { x: ix1, y: iy1, z: zTop }, { x: ix1, y: iy1, z: zBot }])
-  }
-
-  // End caps (close the arc at start and end angles)
-  const aStart = angles[0], aEnd = angles[steps]
-  const csS = Math.cos(aStart), snS = Math.sin(aStart)
-  const csE = Math.cos(aEnd), snE = Math.sin(aEnd)
-
-  // Start cap — normal points in -tangent direction (away from arc interior)
-  tris.push([
-    { x: csS * r0, y: snS * r0, z: zBot },
-    { x: csS * r1, y: snS * r1, z: zBot },
-    { x: csS * r1, y: snS * r1, z: zTop },
-  ])
-  tris.push([
-    { x: csS * r0, y: snS * r0, z: zBot },
-    { x: csS * r1, y: snS * r1, z: zTop },
-    { x: csS * r0, y: snS * r0, z: zTop },
-  ])
-
-  // End cap — normal points in +tangent direction (away from arc interior)
-  tris.push([
-    { x: csE * r1, y: snE * r1, z: zBot },
-    { x: csE * r0, y: snE * r0, z: zBot },
-    { x: csE * r0, y: snE * r0, z: zTop },
-  ])
-  tris.push([
-    { x: csE * r1, y: snE * r1, z: zBot },
-    { x: csE * r0, y: snE * r0, z: zTop },
-    { x: csE * r1, y: snE * r1, z: zTop },
-  ])
-
-  return tris
+function solidEdgeSpot(angle, centerRadius, radius, zBot, zTop, segments) {
+  return translate(
+    solidCylinder(radius, zBot, zTop, segments),
+    Math.cos(angle) * centerRadius,
+    Math.sin(angle) * centerRadius,
+    0
+  )
 }
 
 // ─── Text geometry via opentype.js + earcut ─────────────────────────
@@ -261,6 +202,116 @@ function addHoleWalls(tris, pts, z0, z1) {
     const p0 = pts[i], p1 = pts[(i + 1) % pts.length]
     tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p1.x, y: p1.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }])
     tris.push([{ x: p0.x, y: p0.y, z: z0 }, { x: p1.x, y: p1.y, z: z1 }, { x: p0.x, y: p0.y, z: z1 }])
+  }
+}
+
+function extrudePolygon(points, z0, z1) {
+  const outer = signedArea(points) >= 0 ? points : [...points].reverse()
+  const tris2D = triangulatePoly(outer, [])
+  const triangles = []
+
+  for (const [a, b, c] of tris2D) {
+    triangles.push([
+      { x: a.x, y: a.y, z: z1 },
+      { x: b.x, y: b.y, z: z1 },
+      { x: c.x, y: c.y, z: z1 },
+    ])
+    triangles.push([
+      { x: c.x, y: c.y, z: z0 },
+      { x: b.x, y: b.y, z: z0 },
+      { x: a.x, y: a.y, z: z0 },
+    ])
+  }
+
+  addOuterWalls(triangles, outer, z0, z1)
+  return triangles
+}
+
+function createClassicBodyProfile(bodyRadius, grooveCount, grooveRadius, grooveSegments, bodySegments) {
+  if (grooveCount <= 0) return null
+
+  const grooveCenterRadius = getGrooveCenterRadius(bodyRadius, grooveRadius)
+  const grooveArc = getGrooveIntersectionInfo(bodyRadius, grooveCenterRadius, grooveRadius)
+  if (!grooveArc) return null
+
+  const outline = []
+  const angleStep = (Math.PI * 2) / grooveCount
+  for (let i = 0; i < grooveCount; i++) {
+    const angle = i * angleStep
+    const nextAngle = (i + 1) * angleStep
+    appendArcPoints(outline, grooveCenterRadius, angle, grooveRadius, grooveArc.grooveStart, grooveArc.grooveEnd, grooveSegments, i === 0)
+    appendArcPoints(outline, 0, 0, bodyRadius, angle + grooveArc.bodyEnd, nextAngle + grooveArc.bodyStart, bodySegments, false)
+  }
+
+  cleanOutlinePoints(outline)
+  if (signedArea(outline) < 0) outline.reverse()
+  return outline
+}
+
+function getGrooveCenterRadius(bodyRadius, radius) {
+  return bodyRadius - radius / 3
+}
+
+function getGrooveIntersectionInfo(bodyRadius, centerRadius, radius) {
+  const d = centerRadius
+  if (d <= 0) return null
+
+  const x = (bodyRadius * bodyRadius - radius * radius + d * d) / (2 * d)
+  const h2 = bodyRadius * bodyRadius - x * x
+  if (h2 <= 0) return null
+
+  const h = Math.sqrt(h2)
+  return {
+    bodyStart: Math.atan2(h, x),
+    bodyEnd: Math.atan2(-h, x),
+    grooveStart: Math.atan2(h, x - d),
+    grooveEnd: Math.atan2(-h, x - d) + Math.PI * 2,
+  }
+}
+
+function appendArcPoints(points, centerRadius, angle, radius, start, end, segments, includeStart) {
+  const radial = { x: Math.cos(angle), y: Math.sin(angle) }
+  const tangent = { x: -Math.sin(angle), y: Math.cos(angle) }
+  const startIndex = includeStart ? 0 : 1
+  for (let i = startIndex; i <= segments; i++) {
+    const t = i / segments
+    const a = start + (end - start) * t
+    points.push(localToWorld(
+      centerRadius + Math.cos(a) * radius,
+      Math.sin(a) * radius,
+      radial,
+      tangent
+    ))
+  }
+}
+
+function cleanOutlinePoints(points) {
+  const EPS2 = 1e-10
+  let write = 0
+  for (let read = 0; read < points.length; read++) {
+    const prev = write > 0 ? points[write - 1] : null
+    const cur = points[read]
+    if (!prev || distSq2D(prev, cur) > EPS2) {
+      points[write++] = cur
+    }
+  }
+  points.length = write
+
+  while (points.length > 1 && distSq2D(points[0], points[points.length - 1]) <= EPS2) {
+    points.pop()
+  }
+}
+
+function distSq2D(a, b) {
+  const dx = a.x - b.x
+  const dy = a.y - b.y
+  return dx * dx + dy * dy
+}
+
+function localToWorld(x, y, radial, tangent) {
+  return {
+    x: radial.x * x + tangent.x * y,
+    y: radial.y * x + tangent.y * y,
   }
 }
 
@@ -630,9 +681,14 @@ async function generateSTLFiles(params, outputDir, onProgress) {
 
   const parts = {}
 
-  // 1. Body: solid cylinder
+  // 1. Body
   onProgress?.({ stage: 'generating', percent: 10, detail: '主体' })
-  parts.body = solidCylinder(R, -halfT, halfT, SEG)
+  if (style === 'classic' && grooveCount > 0) {
+    const bodyProfile = createClassicBodyProfile(R, grooveCount, grooveRadius + GAP, 24, 16)
+    parts.body = bodyProfile ? extrudePolygon(bodyProfile, -halfT, halfT) : solidCylinder(R, -halfT, halfT, SEG)
+  } else {
+    parts.body = solidCylinder(R, -halfT, halfT, SEG)
+  }
 
   // 2. Name text: sits on top face (+Z) with GAP separation from body
   onProgress?.({ stage: 'generating', percent: 25, detail: '正面文字' })
@@ -654,15 +710,14 @@ async function generateSTLFiles(params, outputDir, onProgress) {
     }
   }
 
-  // 4. Grooves / edge spots (classic style) — sit outside body edge with GAP
+  // 4. Grooves / full round edge cylinders (classic style)
   if (style === 'classic' && grooveCount > 0) {
     onProgress?.({ stage: 'generating', percent: 55, detail: '边缘凹槽' })
     const spotTris = []
-    const angWidth = (2 * Math.PI / grooveCount) * 0.5
-    const protrudeDepth = grooveRadius * 0.6
+    const centerRadius = getGrooveCenterRadius(R, grooveRadius)
     for (let i = 0; i < grooveCount; i++) {
       const angle = (i / grooveCount) * 2 * Math.PI
-      spotTris.push(...solidEdgeSpot(angle, angWidth, R + GAP, protrudeDepth, -halfT, halfT, 4))
+      spotTris.push(...solidEdgeSpot(angle, centerRadius, grooveRadius, -halfT, halfT, 24))
     }
     parts.grooves = spotTris
   }

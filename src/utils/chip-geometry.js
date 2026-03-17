@@ -7,7 +7,7 @@ import * as THREE from 'three'
  * Strategy: parts do NOT overlap.
  *   - Body = solid cylinder (main mass)
  *   - Text, rim ring protrude OUTWARD from the body surface
- *   - Grooves (classic) are edge spots protruding outward from the side
+ *   - Grooves (classic) are full round cylinders embedded 2/3 into the edge
  */
 export function generateChipGeometries(config) {
   const {
@@ -26,10 +26,14 @@ export function generateChipGeometries(config) {
   const halfT = thickness / 2
   const parts = {}
 
-  // 1. Body — solid cylinder
-  const bodyGeo = new THREE.CylinderGeometry(R, R, thickness, 64)
-  bodyGeo.rotateX(Math.PI / 2) // Z-axis = thickness
-  parts.body = bodyGeo
+  // 1. Body
+  if (style === 'classic' && grooveCount > 0) {
+    parts.body = createClassicBodyGeometry(R, grooveCount, grooveRadius, thickness, 48, 24)
+  } else {
+    const bodyGeo = new THREE.CylinderGeometry(R, R, thickness, 64)
+    bodyGeo.rotateX(Math.PI / 2) // Z-axis = thickness
+    parts.body = bodyGeo
+  }
 
   // 2. Name text (protrudes from top face, z = halfT to halfT + textDepth)
   const nameParts = createTextPlaceholder(name, R * 0.35, textDepth)
@@ -46,14 +50,13 @@ export function generateChipGeometries(config) {
     parts.valueText = valueParts
   }
 
-  // 4. Grooves — edge spots protruding outward (classic only)
+  // 4. Grooves — full round cylinders embedded into the edge (classic only)
   if (style === 'classic' && grooveCount > 0) {
     const spotGeos = []
-    const angWidth = (2 * Math.PI / grooveCount) * 0.5
-    const protrudeDepth = grooveRadius * 0.6
+    const centerRadius = getGrooveCenterRadius(R, grooveRadius)
     for (let i = 0; i < grooveCount; i++) {
       const angle = (i / grooveCount) * Math.PI * 2
-      const spot = createEdgeSpot(angle, angWidth, R, protrudeDepth, halfT, 4)
+      const spot = createEdgeCylinder(angle, centerRadius, grooveRadius, thickness, 24)
       if (spot) spotGeos.push(spot)
     }
     if (spotGeos.length > 0) {
@@ -131,35 +134,132 @@ function createCharShape(x, y, w, h) {
 }
 
 /**
- * Create an edge spot (groove) as an arc-shaped prism protruding outward from body.
+ * Create the classic body with cylindrical sockets on the edge.
  */
-function createEdgeSpot(angle, angularWidth, bodyRadius, protrudeDepth, halfT, arcSteps) {
-  const r0 = bodyRadius
-  const r1 = bodyRadius + protrudeDepth
-  const halfAng = angularWidth / 2
+function createClassicBodyGeometry(bodyRadius, grooveCount, grooveRadius, thickness, grooveSegments, bodySegments) {
+  const profile = createClassicBodyProfile(bodyRadius, grooveCount, grooveRadius, grooveSegments, bodySegments)
+  if (!profile || profile.length < 3) return null
 
   const shape = new THREE.Shape()
-  // Outer arc
-  for (let s = 0; s <= arcSteps; s++) {
-    const a = angle - halfAng + (s / arcSteps) * angularWidth
-    const x = Math.cos(a) * r1
-    const y = Math.sin(a) * r1
-    if (s === 0) shape.moveTo(x, y)
-    else shape.lineTo(x, y)
-  }
-  // Inner arc (reverse)
-  for (let s = arcSteps; s >= 0; s--) {
-    const a = angle - halfAng + (s / arcSteps) * angularWidth
-    shape.lineTo(Math.cos(a) * r0, Math.sin(a) * r0)
+  shape.moveTo(profile[0].x, profile[0].y)
+  for (let i = 1; i < profile.length; i++) {
+    shape.lineTo(profile[i].x, profile[i].y)
   }
   shape.closePath()
 
   const geo = new THREE.ExtrudeGeometry(shape, {
-    depth: halfT * 2, // full chip thickness
+    depth: thickness,
     bevelEnabled: false,
   })
-  geo.translate(0, 0, -halfT) // center on z=0
+  geo.translate(0, 0, -thickness / 2)
   return geo
+}
+
+function createClassicBodyProfile(bodyRadius, grooveCount, grooveRadius, grooveSegments, bodySegments) {
+  if (grooveCount <= 0) return null
+
+  const grooveCenterRadius = getGrooveCenterRadius(bodyRadius, grooveRadius)
+  const grooveArc = getGrooveIntersectionInfo(bodyRadius, grooveCenterRadius, grooveRadius)
+  if (!grooveArc) return null
+
+  const outline = []
+  const angleStep = (Math.PI * 2) / grooveCount
+  for (let i = 0; i < grooveCount; i++) {
+    const angle = i * angleStep
+    const nextAngle = (i + 1) * angleStep
+    appendArcPoints(outline, grooveCenterRadius, angle, grooveRadius, grooveArc.grooveStart, grooveArc.grooveEnd, grooveSegments, i === 0)
+    appendArcPoints(outline, 0, 0, bodyRadius, angle + grooveArc.bodyEnd, nextAngle + grooveArc.bodyStart, bodySegments, false)
+  }
+
+  cleanOutlinePoints(outline)
+  if (signedArea2D(outline) < 0) outline.reverse()
+  return outline
+}
+
+function getGrooveCenterRadius(bodyRadius, radius) {
+  return bodyRadius - radius / 3
+}
+
+function getGrooveIntersectionInfo(bodyRadius, centerRadius, radius) {
+  const d = centerRadius
+  if (d <= 0) return null
+
+  const x = (bodyRadius * bodyRadius - radius * radius + d * d) / (2 * d)
+  const h2 = bodyRadius * bodyRadius - x * x
+  if (h2 <= 0) return null
+
+  const h = Math.sqrt(h2)
+  return {
+    bodyStart: Math.atan2(h, x),
+    bodyEnd: Math.atan2(-h, x),
+    grooveStart: Math.atan2(h, x - d),
+    grooveEnd: Math.atan2(-h, x - d) + Math.PI * 2,
+  }
+}
+
+function appendArcPoints(points, centerRadius, angle, radius, start, end, segments, includeStart) {
+  const radial = { x: Math.cos(angle), y: Math.sin(angle) }
+  const tangent = { x: -Math.sin(angle), y: Math.cos(angle) }
+  const startIndex = includeStart ? 0 : 1
+  for (let i = startIndex; i <= segments; i++) {
+    const t = i / segments
+    const a = start + (end - start) * t
+    points.push(localToWorld(
+      centerRadius + Math.cos(a) * radius,
+      Math.sin(a) * radius,
+      radial,
+      tangent
+    ))
+  }
+}
+
+function cleanOutlinePoints(points) {
+  const EPS2 = 1e-10
+  let write = 0
+  for (let read = 0; read < points.length; read++) {
+    const prev = write > 0 ? points[write - 1] : null
+    const cur = points[read]
+    if (!prev || distSq2D(prev, cur) > EPS2) {
+      points[write++] = cur
+    }
+  }
+  points.length = write
+
+  while (points.length > 1 && distSq2D(points[0], points[points.length - 1]) <= EPS2) {
+    points.pop()
+  }
+}
+
+function distSq2D(a, b) {
+  const dx = a.x - b.x
+  const dy = a.y - b.y
+  return dx * dx + dy * dy
+}
+
+/**
+ * Create a full round cylinder on the chip edge.
+ */
+function createEdgeCylinder(angle, centerRadius, radius, thickness, radialSegments) {
+  const geo = new THREE.CylinderGeometry(radius, radius, thickness, radialSegments)
+  geo.rotateX(Math.PI / 2) // Z-axis = thickness
+  geo.translate(Math.cos(angle) * centerRadius, Math.sin(angle) * centerRadius, 0)
+  return geo
+}
+
+function localToWorld(x, y, radial, tangent) {
+  return {
+    x: radial.x * x + tangent.x * y,
+    y: radial.y * x + tangent.y * y,
+  }
+}
+
+function signedArea2D(points) {
+  let area = 0
+  for (let i = 0; i < points.length; i++) {
+    const j = (i + 1) % points.length
+    area += points[i].x * points[j].y - points[j].x * points[i].y
+  }
+  return area / 2
 }
 
 function mergeBufferGeometries(geometries) {
