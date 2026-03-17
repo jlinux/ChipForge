@@ -5,8 +5,9 @@ const AdmZip = require('adm-zip')
 
 const DEFAULT_FONT_PATH = path.join(__dirname, '../fonts/NotoSansSC-Regular.ttf')
 
-// Tiny gap (0.001mm) between body surface and protruding parts to avoid coplanar faces
-const EPS = 0.001
+// Parts overlap the body by 0.2mm so slicers can do proper boolean subtraction.
+// This is the standard approach for multi-color 3D printing (avoids non-manifold gaps).
+const OVERLAP = 0.2
 
 // ─── Binary STL writer ──────────────────────────────────────────────
 // Normal is computed from (v1-v0)×(v2-v0) — so CCW winding = outward normal.
@@ -433,7 +434,12 @@ function write3MF(partsWithColors, outputPath) {
       `          <triangle v1="${t.v1}" v2="${t.v2}" v3="${t.v3}" />`
     ).join('\n')
 
+    // Each child object gets slic3rpe:extruder metadata for Bambu Studio color assignment.
+    // Extruder numbers are 1-based (filament slot 1, 2, 3, ...).
+    const extruderNum = pi + 1
     objectXmls.push(`    <object id="${objId}" type="model" pid="${matId}" pindex="${pi}">
+      <metadata name="slic3rpe:extruder" value="${extruderNum}" />
+      <metadata name="slic3rpe:name" value="${escXml(part.name)}" />
       <mesh>
         <vertices>
 ${vertXml}
@@ -457,7 +463,8 @@ ${componentRefs.join('\n')}
 
   const modelXml = `<?xml version="1.0" encoding="UTF-8"?>
 <model unit="millimeter" xml:lang="en-US"
-  xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">
+  xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02"
+  xmlns:slic3rpe="http://schemas.slic3r.org/3mf/2017/06">
   <resources>
     <basematerials id="${matId}">
 ${matEntries}
@@ -528,27 +535,27 @@ async function generateSTLFiles(params, outputDir, onProgress) {
   onProgress?.({ stage: 'generating', percent: 10, detail: '主体' })
   parts.body = solidCylinder(R, -halfT, halfT, SEG)
 
-  // 2. Name text: protrudes from top face (+Z) with epsilon gap
+  // 2. Name text: protrudes from top face (+Z), overlaps body by OVERLAP
   onProgress?.({ stage: 'generating', percent: 25, detail: '正面文字' })
   const fontFile = fontPath || DEFAULT_FONT_PATH
   if (name) {
     const rawText = generateTextTriangles(name, fontFile, R * 0.4, textDepth)
     if (rawText.length > 0) {
-      parts.nameText = translate(rawText, 0, 0, halfT + EPS)
+      parts.nameText = translate(rawText, 0, 0, halfT - OVERLAP)
     }
   }
 
-  // 3. Value text: protrudes from bottom face (-Z) with epsilon gap
+  // 3. Value text: protrudes from bottom face (-Z), overlaps body by OVERLAP
   onProgress?.({ stage: 'generating', percent: 40, detail: '背面文字' })
   if (value) {
     const rawVal = generateTextTriangles(value, fontFile, R * 0.5, textDepth)
     if (rawVal.length > 0) {
       const flipped = rotateY180(rawVal)
-      parts.valueText = translate(flipped, 0, 0, -halfT - EPS)
+      parts.valueText = translate(flipped, 0, 0, -halfT + OVERLAP)
     }
   }
 
-  // 4. Grooves / edge spots (classic style) — offset outward by EPS
+  // 4. Grooves / edge spots (classic style) — overlap body by OVERLAP
   if (style === 'classic' && grooveCount > 0) {
     onProgress?.({ stage: 'generating', percent: 55, detail: '边缘凹槽' })
     const spotTris = []
@@ -556,18 +563,18 @@ async function generateSTLFiles(params, outputDir, onProgress) {
     const protrudeDepth = grooveRadius * 0.6
     for (let i = 0; i < grooveCount; i++) {
       const angle = (i / grooveCount) * 2 * Math.PI
-      spotTris.push(...solidEdgeSpot(angle, angWidth, R + EPS, protrudeDepth, -halfT, halfT, 4))
+      spotTris.push(...solidEdgeSpot(angle, angWidth, R - OVERLAP, protrudeDepth + OVERLAP, -halfT, halfT, 4))
     }
     parts.grooves = spotTris
   }
 
-  // 5. Rim rings: protrude from top & bottom with epsilon gap
+  // 5. Rim rings: protrude from top & bottom, overlap body by OVERLAP
   onProgress?.({ stage: 'generating', percent: 70, detail: '边框环' })
   const rimOuter = R - 0.5
   const rimInner = rimOuter - rimWidth
   if (rimInner > 0) {
-    const topRim = solidRing(rimOuter, rimInner, halfT + EPS, halfT + EPS + textDepth, SEG)
-    const botRim = solidRing(rimOuter, rimInner, -(halfT + EPS + textDepth), -(halfT + EPS), SEG)
+    const topRim = solidRing(rimOuter, rimInner, halfT - OVERLAP, halfT - OVERLAP + textDepth + OVERLAP, SEG)
+    const botRim = solidRing(rimOuter, rimInner, -(halfT - OVERLAP + textDepth + OVERLAP), -(halfT - OVERLAP), SEG)
     parts.rimRing = [...topRim, ...botRim]
   }
 
