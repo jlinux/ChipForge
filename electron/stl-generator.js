@@ -7,6 +7,7 @@ const { normalizeLocale, t } = require('./i18n')
 const DEFAULT_FONT_PATH = path.join(__dirname, '../fonts/NotoSansSC-Regular.ttf')
 const INSET_SIDE_GAP = 0.03
 const HOLE_JITTER = 1e-4
+const CURVE_STEPS = 20
 
 // Tiny gap (1µm) between text / rim parts and body to eliminate shared faces.
 const PART_GAP = 0.001
@@ -115,14 +116,52 @@ function solidEdgeSpot(angle, centerRadius, radius, zBot, zTop, segments) {
 
 // ─── Text geometry via opentype.js + earcut ─────────────────────────
 
-function generateTextPolygons(text, fontFilePath, fontSize) {
+function isTwoCjkChars(text) {
+  return /^[\u4e00-\u9fff]{2}$/.test((text || '').trim())
+}
+
+function getTextLayoutProfile(text, side, bodyRadius) {
+  const profile = {
+    fontSize: bodyRadius * (side === 'value' ? 0.5 : 0.4),
+    tracking: 0,
+    safePadding: 3.5,
+  }
+
+  if (isTwoCjkChars(text)) {
+    profile.fontSize = bodyRadius * (side === 'value' ? 0.62 : 0.56)
+    profile.tracking = profile.fontSize * 0.22
+    profile.safePadding = 2.4
+  }
+
+  return profile
+}
+
+function layoutTextCommands(font, text, fontSize, tracking = 0) {
+  const glyphs = font.stringToGlyphs(text)
+  const commands = []
+  let x = 0
+
+  glyphs.forEach((glyph, index) => {
+    const glyphPath = glyph.getPath(x, 0, fontSize)
+    commands.push(...(glyphPath.commands || []))
+
+    const advance = ((glyph.advanceWidth || font.unitsPerEm) / font.unitsPerEm) * fontSize
+    x += advance
+    if (index < glyphs.length - 1) x += tracking
+  })
+
+  return commands
+}
+
+function generateTextPolygons(text, fontFilePath, fontSize, options = {}) {
+  const { tracking = 0 } = options
   let opentype
   try { opentype = require('opentype.js') } catch { return [] }
   let font
   try { font = opentype.loadSync(fontFilePath) } catch { return [] }
 
-  const otPath = font.getPath(text, 0, 0, fontSize)
-  const rawPolygons = commandsToPolygons(otPath.commands || [])
+  const commands = layoutTextCommands(font, text, fontSize, tracking)
+  const rawPolygons = commandsToPolygons(commands)
   if (rawPolygons.length === 0) return []
 
   // Bounding box for centering
@@ -161,8 +200,8 @@ function stabilizePolygons(polygons) {
   })
 }
 
-function generateTextTriangles(text, fontFilePath, fontSize, depth) {
-  const polygons = generateTextPolygons(text, fontFilePath, fontSize)
+function generateTextTriangles(text, fontFilePath, fontSize, depth, options = {}) {
+  const polygons = generateTextPolygons(text, fontFilePath, fontSize, options)
   if (polygons.length === 0) return []
 
   const triangles = []
@@ -536,11 +575,11 @@ function buildInsetTextTriangles(polygons, z0, z1) {
   return sealPlanarHoles(triangles)
 }
 
-function getInsetSafeRadius(bodyRadius, grooveCount, grooveRadius) {
+function getInsetSafeRadius(bodyRadius, grooveCount, grooveRadius, padding = 3.5) {
   const baseRadius = grooveCount > 0
     ? getGrooveCenterRadius(bodyRadius, grooveRadius) - grooveRadius
     : bodyRadius
-  return Math.max(baseRadius - 3.5, bodyRadius * 0.45)
+  return Math.max(baseRadius - padding, bodyRadius * 0.45)
 }
 
 function createClassicBodyProfile(bodyRadius, grooveCount, grooveRadius, grooveSegments, bodySegments, grooveCenterRadius = getGrooveCenterRadius(bodyRadius, grooveRadius)) {
@@ -673,7 +712,8 @@ function commandsToPolygons(commands) {
         break
       case 'Q': {
         const p = cur[cur.length - 1]
-        for (let t = 0.1; t <= 1.001; t += 0.1) {
+        for (let i = 1; i <= CURVE_STEPS; i++) {
+          const t = i / CURVE_STEPS
           const mt = 1 - t
           cur.push({
             x: mt * mt * p.x + 2 * mt * t * c.x1 + t * t * c.x,
@@ -684,7 +724,8 @@ function commandsToPolygons(commands) {
       }
       case 'C': {
         const p = cur[cur.length - 1]
-        for (let t = 0.1; t <= 1.001; t += 0.1) {
+        for (let i = 1; i <= CURVE_STEPS; i++) {
+          const t = i / CURVE_STEPS
           const mt = 1 - t
           cur.push({
             x: mt*mt*mt*p.x + 3*mt*mt*t*c.x1 + 3*mt*t*t*c.x2 + t*t*t*c.x,
@@ -1045,9 +1086,18 @@ async function generateSTLFiles(params, outputDir, onProgress) {
   }
 
   const fontFile = fontPath || DEFAULT_FONT_PATH
-  const insetSafeRadius = getInsetSafeRadius(R, grooveCount, grooveRadius)
-  const namePolygons = name ? fitPolygonsWithinRadius(generateTextPolygons(name, fontFile, R * 0.4), insetSafeRadius) : []
-  const valuePolygons = value ? mirrorPolygonsForBottom(fitPolygonsWithinRadius(generateTextPolygons(value, fontFile, R * 0.5), insetSafeRadius)) : []
+  const nameLayout = getTextLayoutProfile(name, 'name', R)
+  const valueLayout = getTextLayoutProfile(value, 'value', R)
+  const nameSafeRadius = getInsetSafeRadius(R, grooveCount, grooveRadius, nameLayout.safePadding)
+  const valueSafeRadius = getInsetSafeRadius(R, grooveCount, grooveRadius, valueLayout.safePadding)
+  const namePolygons = name
+    ? fitPolygonsWithinRadius(generateTextPolygons(name, fontFile, nameLayout.fontSize, { tracking: nameLayout.tracking }), nameSafeRadius)
+    : []
+  const valuePolygons = value
+    ? mirrorPolygonsForBottom(
+      fitPolygonsWithinRadius(generateTextPolygons(value, fontFile, valueLayout.fontSize, { tracking: valueLayout.tracking }), valueSafeRadius)
+    )
+    : []
   const insetNamePolygons = shrinkPolygonsUniform(namePolygons, INSET_SIDE_GAP)
   const insetValuePolygons = shrinkPolygonsUniform(valuePolygons, INSET_SIDE_GAP)
 
@@ -1072,7 +1122,7 @@ async function generateSTLFiles(params, outputDir, onProgress) {
     // 2. Name text: sits on top face (+Z) with PART_GAP separation from body
     onProgress?.({ stage: 'generating', percent: 25, detail: t(currentLocale, 'nameText') })
     if (namePolygons.length > 0) {
-      const rawText = generateTextTriangles(name, fontFile, R * 0.4, textDepth)
+      const rawText = generateTextTriangles(name, fontFile, nameLayout.fontSize, textDepth, { tracking: nameLayout.tracking })
       if (rawText.length > 0) {
         parts.nameText = translate(rawText, 0, 0, halfT + PART_GAP)
       }
@@ -1083,7 +1133,7 @@ async function generateSTLFiles(params, outputDir, onProgress) {
   if (style !== 'engraved') {
     onProgress?.({ stage: 'generating', percent: 40, detail: t(currentLocale, 'valueText') })
     if (value) {
-      const rawVal = generateTextTriangles(value, fontFile, R * 0.5, textDepth)
+      const rawVal = generateTextTriangles(value, fontFile, valueLayout.fontSize, textDepth, { tracking: valueLayout.tracking })
       if (rawVal.length > 0) {
         const flipped = rotateY180(rawVal)
         parts.valueText = translate(flipped, 0, 0, -halfT - PART_GAP)

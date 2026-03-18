@@ -3,6 +3,7 @@ import opentype from 'opentype.js'
 
 const INSET_SIDE_GAP = 0.03
 const HOLE_JITTER = 1e-4
+const CURVE_STEPS = 20
 
 /**
  * Generate chip part geometries for 3D preview.
@@ -29,6 +30,8 @@ export function generateChipGeometries(config, fontData) {
   const R = diameter / 2
   const halfT = thickness / 2
   const parts = {}
+  const nameLayout = getTextLayoutProfile(name, 'name', R)
+  const valueLayout = getTextLayoutProfile(value, 'value', R)
   const bodyProfile = (style === 'classic' || style === 'engraved') && grooveCount > 0
     ? createClassicBodyProfile(R, grooveCount, grooveRadius, 48, 24)
     : null
@@ -44,7 +47,7 @@ export function generateChipGeometries(config, fontData) {
 
   // 2. Name text (protrudes from top face, z = halfT to halfT + textDepth)
   if (style !== 'engraved') {
-    const nameParts = createTextGeometry(name, R * 0.35, textDepth, fontData)
+    const nameParts = createTextGeometry(name, nameLayout.fontSize, textDepth, fontData, { tracking: nameLayout.tracking })
     if (nameParts) {
       nameParts.translate(0, 0, halfT) // bottom of extrusion at body surface
       parts.nameText = nameParts
@@ -53,7 +56,7 @@ export function generateChipGeometries(config, fontData) {
 
   // 3. Value text (protrudes from bottom face)
   if (style !== 'engraved') {
-    const valueParts = createTextGeometry(value, R * 0.45, textDepth, fontData)
+    const valueParts = createTextGeometry(value, valueLayout.fontSize, textDepth, fontData, { tracking: valueLayout.tracking })
     if (valueParts) {
       valueParts.rotateY(Math.PI)
       valueParts.translate(0, 0, -halfT) // top of extrusion at body surface
@@ -104,7 +107,7 @@ export function generateChipGeometries(config, fontData) {
   }
 
   if (style === 'engraved') {
-    applyInsetPreview(parts, name, value, fontData, R * 0.35, R * 0.45, textDepth, bodyProfile, R, grooveCount, grooveRadius, thickness)
+    applyInsetPreview(parts, name, value, fontData, nameLayout, valueLayout, textDepth, bodyProfile, R, grooveCount, grooveRadius, thickness)
   }
 
   return parts
@@ -113,8 +116,28 @@ export function generateChipGeometries(config, fontData) {
 /**
  * Create text geometry from a font outline for accurate preview.
  */
-function createTextGeometry(text, fontSize, depth, fontData) {
-  const polygons = getTextPolygons(text, fontSize, fontData)
+function isTwoCjkChars(text) {
+  return /^[\u4e00-\u9fff]{2}$/.test((text || '').trim())
+}
+
+function getTextLayoutProfile(text, side, bodyRadius) {
+  const profile = {
+    fontSize: bodyRadius * (side === 'value' ? 0.5 : 0.4),
+    tracking: 0,
+    safePadding: 3.5,
+  }
+
+  if (isTwoCjkChars(text)) {
+    profile.fontSize = bodyRadius * (side === 'value' ? 0.62 : 0.56)
+    profile.tracking = profile.fontSize * 0.22
+    profile.safePadding = 2.4
+  }
+
+  return profile
+}
+
+function createTextGeometry(text, fontSize, depth, fontData, options = {}) {
+  const polygons = getTextPolygons(text, fontSize, fontData, options)
   if (polygons.length === 0) return null
   const geometries = []
 
@@ -128,7 +151,25 @@ function createTextGeometry(text, fontSize, depth, fontData) {
   return mergeBufferGeometries(geometries)
 }
 
-function getTextPolygons(text, fontSize, fontData) {
+function layoutTextCommands(font, text, fontSize, tracking = 0) {
+  const glyphs = font.stringToGlyphs(text)
+  const commands = []
+  let x = 0
+
+  glyphs.forEach((glyph, index) => {
+    const glyphPath = glyph.getPath(x, 0, fontSize)
+    commands.push(...(glyphPath.commands || []))
+
+    const advance = ((glyph.advanceWidth || font.unitsPerEm) / font.unitsPerEm) * fontSize
+    x += advance
+    if (index < glyphs.length - 1) x += tracking
+  })
+
+  return commands
+}
+
+function getTextPolygons(text, fontSize, fontData, options = {}) {
+  const { tracking = 0 } = options
   if (!text || !fontData) return []
 
   let font
@@ -138,8 +179,7 @@ function getTextPolygons(text, fontSize, fontData) {
     return []
   }
 
-  const otPath = font.getPath(text, 0, 0, fontSize)
-  const rawPolygons = commandsToPolygons(otPath.commands || [])
+  const rawPolygons = commandsToPolygons(layoutTextCommands(font, text, fontSize, tracking))
   if (rawPolygons.length === 0) return []
 
   let minX = Infinity
@@ -183,10 +223,19 @@ function stabilizePolygons(polygons) {
   })
 }
 
-function applyInsetPreview(parts, frontText, backText, fontData, frontFontSize, backFontSize, textDepth, bodyProfile, bodyRadius, grooveCount, grooveRadius, thickness) {
-  const safeRadius = getInsetSafeRadius(bodyRadius, grooveCount, grooveRadius)
-  const frontPolygons = fitPolygonsWithinRadius(getTextPolygons(frontText, frontFontSize, fontData), safeRadius)
-  const backPolygons = mirrorPolygonsForBottom(fitPolygonsWithinRadius(getTextPolygons(backText, backFontSize, fontData), safeRadius))
+function applyInsetPreview(parts, frontText, backText, fontData, frontLayout, backLayout, textDepth, bodyProfile, bodyRadius, grooveCount, grooveRadius, thickness) {
+  const frontSafeRadius = getInsetSafeRadius(bodyRadius, grooveCount, grooveRadius, frontLayout.safePadding)
+  const backSafeRadius = getInsetSafeRadius(bodyRadius, grooveCount, grooveRadius, backLayout.safePadding)
+  const frontPolygons = fitPolygonsWithinRadius(
+    getTextPolygons(frontText, frontLayout.fontSize, fontData, { tracking: frontLayout.tracking }),
+    frontSafeRadius
+  )
+  const backPolygons = mirrorPolygonsForBottom(
+    fitPolygonsWithinRadius(
+      getTextPolygons(backText, backLayout.fontSize, fontData, { tracking: backLayout.tracking }),
+      backSafeRadius
+    )
+  )
   if (frontPolygons.length === 0 && backPolygons.length === 0) return
 
   const insetDepth = Math.min(textDepth, thickness / 2)
@@ -299,7 +348,8 @@ function commandsToPolygons(commands) {
         break
       case 'Q': {
         const p = cur[cur.length - 1]
-        for (let t = 0.1; t <= 1.001; t += 0.1) {
+        for (let i = 1; i <= CURVE_STEPS; i++) {
+          const t = i / CURVE_STEPS
           const mt = 1 - t
           cur.push({
             x: mt * mt * p.x + 2 * mt * t * c.x1 + t * t * c.x,
@@ -310,7 +360,8 @@ function commandsToPolygons(commands) {
       }
       case 'C': {
         const p = cur[cur.length - 1]
-        for (let t = 0.1; t <= 1.001; t += 0.1) {
+        for (let i = 1; i <= CURVE_STEPS; i++) {
+          const t = i / CURVE_STEPS
           const mt = 1 - t
           cur.push({
             x: mt * mt * mt * p.x + 3 * mt * mt * t * c.x1 + 3 * mt * t * t * c.x2 + t * t * t * c.x,
@@ -495,11 +546,11 @@ function fitPolygonsWithinRadius(polygons, maxRadius) {
   }))
 }
 
-function getInsetSafeRadius(bodyRadius, grooveCount, grooveRadius) {
+function getInsetSafeRadius(bodyRadius, grooveCount, grooveRadius, padding = 3.5) {
   const baseRadius = grooveCount > 0
     ? getGrooveCenterRadius(bodyRadius, grooveRadius) - grooveRadius
     : bodyRadius
-  return Math.max(baseRadius - 3.5, bodyRadius * 0.45)
+  return Math.max(baseRadius - padding, bodyRadius * 0.45)
 }
 
 function createCircleProfile(radius, segments) {
