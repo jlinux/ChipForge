@@ -5,12 +5,15 @@ const AdmZip = require('adm-zip')
 const { normalizeLocale, t } = require('./i18n')
 
 const DEFAULT_FONT_PATH = path.join(__dirname, '../fonts/NotoSansSC-Regular.ttf')
+const INSET_SIDE_GAP = 0.03
+const HOLE_JITTER = 1e-4
 
-// Tiny gap (1µm) between colored parts and body to eliminate shared faces/edges.
-// Each part sits just outside the body surface — no mesh intersection, no shared
-// faces → zero non-manifold edges. The gap is invisible at FDM resolution
-// (layer height 100–300µm, nozzle 400µm).
-const GAP = 0.001
+// Tiny gap (1µm) between text / rim parts and body to eliminate shared faces.
+const PART_GAP = 0.001
+// Edge grooves need a larger XY clearance; 1µm is too small and some slicers
+// still collapse the contact at the groove-body seam into repaired non-manifold
+// edges. 30µm remains visually invisible at FDM scale.
+const GROOVE_GAP = 0.03
 
 // ─── Binary STL writer ──────────────────────────────────────────────
 // Normal is computed from (v1-v0)×(v2-v0) — so CCW winding = outward normal.
@@ -35,13 +38,6 @@ function writeBinarySTL(triangles) {
   return buf
 }
 
-// ─── Primitive generators ───────────────────────────────────────────
-// All side/wall faces use the convention: viewed from OUTSIDE, vertices
-// wind COUNTER-CLOCKWISE → outward-pointing normal.
-
-/**
- * Pre-compute circle vertices to ensure exact seam closure (no float drift).
- */
 function circleVerts(radius, segments) {
   const v = []
   for (let i = 0; i < segments; i++) {
@@ -55,7 +51,8 @@ function circleVerts(radius, segments) {
  * Solid closed cylinder: side wall + top cap + bottom cap.
  * Axis = Z.
  */
-function solidCylinder(radius, zBot, zTop, segments) {
+function solidCylinder(radius, zBot, zTop, segments, options = {}) {
+  const { topCap = true, bottomCap = true } = options
   const tris = []
   const cv = circleVerts(radius, segments)
   for (let i = 0; i < segments; i++) {
@@ -65,9 +62,13 @@ function solidCylinder(radius, zBot, zTop, segments) {
     tris.push([{ x: x0, y: y0, z: zTop }, { x: x0, y: y0, z: zBot }, { x: x1, y: y1, z: zBot }])
     tris.push([{ x: x0, y: y0, z: zTop }, { x: x1, y: y1, z: zBot }, { x: x1, y: y1, z: zTop }])
     // Top cap — CCW from above → +Z normal
-    tris.push([{ x: 0, y: 0, z: zTop }, { x: x0, y: y0, z: zTop }, { x: x1, y: y1, z: zTop }])
+    if (topCap) {
+      tris.push([{ x: 0, y: 0, z: zTop }, { x: x0, y: y0, z: zTop }, { x: x1, y: y1, z: zTop }])
+    }
     // Bottom cap — CW from above = CCW from below → -Z normal
-    tris.push([{ x: 0, y: 0, z: zBot }, { x: x1, y: y1, z: zBot }, { x: x0, y: y0, z: zBot }])
+    if (bottomCap) {
+      tris.push([{ x: 0, y: 0, z: zBot }, { x: x1, y: y1, z: zBot }, { x: x0, y: y0, z: zBot }])
+    }
   }
   return tris
 }
@@ -114,22 +115,19 @@ function solidEdgeSpot(angle, centerRadius, radius, zBot, zTop, segments) {
 
 // ─── Text geometry via opentype.js + earcut ─────────────────────────
 
-function generateTextTriangles(text, fontFilePath, fontSize, depth) {
+function generateTextPolygons(text, fontFilePath, fontSize) {
   let opentype
   try { opentype = require('opentype.js') } catch { return [] }
   let font
   try { font = opentype.loadSync(fontFilePath) } catch { return [] }
 
   const otPath = font.getPath(text, 0, 0, fontSize)
-  const cmds = otPath.commands
-  if (!cmds || cmds.length === 0) return []
-
-  const polygons = commandsToPolygons(cmds)
-  if (polygons.length === 0) return []
+  const rawPolygons = commandsToPolygons(otPath.commands || [])
+  if (rawPolygons.length === 0) return []
 
   // Bounding box for centering
   let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity
-  for (const poly of polygons) {
+  for (const poly of rawPolygons) {
     for (const pts of [poly.outer, ...poly.holes]) {
       for (const pt of pts) {
         if (pt.x < minX) minX = pt.x; if (pt.x > maxX) maxX = pt.x
@@ -139,21 +137,38 @@ function generateTextTriangles(text, fontFilePath, fontSize, depth) {
   }
   const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2
 
-  const triangles = []
-  for (const poly of polygons) {
-    // Transform: center and flip Y
+  return stabilizePolygons(rawPolygons.map((poly) => {
     const outerRaw = poly.outer.map(p => ({ x: p.x - cx, y: -(p.y - cy) }))
     const holesRaw = poly.holes.map(h => h.map(p => ({ x: p.x - cx, y: -(p.y - cy) })))
+    return {
+      outer: signedArea(outerRaw) >= 0 ? outerRaw : [...outerRaw].reverse(),
+      holes: holesRaw.map(hole => signedArea(hole) <= 0 ? hole : [...hole].reverse()),
+    }
+  }))
+}
 
-    // Flipping Y reverses contour winding. Normalize here so:
-    // - outer contour is CCW
-    // - hole contours are CW
-    // The wall builders below rely on that convention for outward normals.
-    const outer = signedArea(outerRaw) >= 0 ? outerRaw : [...outerRaw].reverse()
-    const holes = holesRaw.map(hole => signedArea(hole) <= 0 ? hole : [...hole].reverse())
+function stabilizePolygons(polygons) {
+  return polygons.map((poly) => {
+    if (!poly.holes || poly.holes.length === 0) return poly
 
+    return {
+      outer: poly.outer,
+      holes: poly.holes.map((hole, index) => {
+        const dy = (index + 1) * HOLE_JITTER
+        return hole.map((pt) => ({ x: pt.x, y: pt.y + dy }))
+      }),
+    }
+  })
+}
+
+function generateTextTriangles(text, fontFilePath, fontSize, depth) {
+  const polygons = generateTextPolygons(text, fontFilePath, fontSize)
+  if (polygons.length === 0) return []
+
+  const triangles = []
+  for (const poly of polygons) {
     // Use earcut for robust triangulation
-    const tris2D = triangulatePoly(outer, holes)
+    const tris2D = triangulatePoly(poly.outer, poly.holes)
 
     // Front face (z = depth) — CCW from +Z → +Z normal
     for (const [a, b, c] of tris2D) {
@@ -173,12 +188,44 @@ function generateTextTriangles(text, fontFilePath, fontSize, depth) {
     }
 
     // Side walls — outer contour (CCW winding → outward normals)
-    addOuterWalls(triangles, outer, 0, depth)
+    addOuterWalls(triangles, poly.outer, 0, depth)
     // Side walls — holes (reversed direction → inward-facing normals into hole)
-    for (const hole of holes) addHoleWalls(triangles, hole, 0, depth)
+    for (const hole of poly.holes) addHoleWalls(triangles, hole, 0, depth)
   }
 
-  return triangles
+  return sealPlanarHoles(triangles)
+}
+
+function mirrorPolygonsForBottom(polygons) {
+  return polygons.map((poly) => {
+    const outerRaw = poly.outer.map((p) => ({ x: -p.x, y: p.y }))
+    const holesRaw = poly.holes.map((hole) => hole.map((p) => ({ x: -p.x, y: p.y })))
+    return {
+      outer: signedArea(outerRaw) >= 0 ? outerRaw : [...outerRaw].reverse(),
+      holes: holesRaw.map((hole) => signedArea(hole) <= 0 ? hole : [...hole].reverse()),
+    }
+  })
+}
+
+function fitPolygonsWithinRadius(polygons, maxRadius) {
+  if (polygons.length === 0) return polygons
+  let currentMaxRadius = 0
+
+  for (const poly of polygons) {
+    for (const pts of [poly.outer, ...poly.holes]) {
+      for (const pt of pts) {
+        currentMaxRadius = Math.max(currentMaxRadius, Math.hypot(pt.x, pt.y))
+      }
+    }
+  }
+
+  if (currentMaxRadius <= 0 || currentMaxRadius <= maxRadius) return polygons
+
+  const scale = maxRadius / currentMaxRadius
+  return polygons.map((poly) => ({
+    outer: poly.outer.map((pt) => ({ x: pt.x * scale, y: pt.y * scale })),
+    holes: poly.holes.map((hole) => hole.map((pt) => ({ x: pt.x * scale, y: pt.y * scale }))),
+  }))
 }
 
 /**
@@ -206,32 +253,299 @@ function addHoleWalls(tris, pts, z0, z1) {
   }
 }
 
-function extrudePolygon(points, z0, z1) {
-  const outer = signedArea(points) >= 0 ? points : [...points].reverse()
-  const tris2D = triangulatePoly(outer, [])
+function extrudePolygon(points, z0, z1, options = {}) {
+  return extrudePolygonWithHoles(points, [], z0, z1, options)
+}
+
+function polygonFaceTriangles(outer, holes, z, face = 'top') {
+  const tris2D = triangulatePoly(outer, holes)
   const triangles = []
-
   for (const [a, b, c] of tris2D) {
-    triangles.push([
-      { x: a.x, y: a.y, z: z1 },
-      { x: b.x, y: b.y, z: z1 },
-      { x: c.x, y: c.y, z: z1 },
-    ])
-    triangles.push([
-      { x: c.x, y: c.y, z: z0 },
-      { x: b.x, y: b.y, z: z0 },
-      { x: a.x, y: a.y, z: z0 },
-    ])
+    if (face === 'top') {
+      triangles.push([
+        { x: a.x, y: a.y, z },
+        { x: b.x, y: b.y, z },
+        { x: c.x, y: c.y, z },
+      ])
+    } else {
+      triangles.push([
+        { x: c.x, y: c.y, z },
+        { x: b.x, y: b.y, z },
+        { x: a.x, y: a.y, z },
+      ])
+    }
   }
-
-  addOuterWalls(triangles, outer, z0, z1)
   return triangles
 }
 
-function createClassicBodyProfile(bodyRadius, grooveCount, grooveRadius, grooveSegments, bodySegments) {
+function extrudePolygonWithHoles(outerRaw, holesRaw, z0, z1, options = {}) {
+  const { topFace = true, bottomFace = true } = options
+  const outer = signedArea(outerRaw) >= 0 ? outerRaw : [...outerRaw].reverse()
+  const holes = holesRaw.map(hole => signedArea(hole) <= 0 ? hole : [...hole].reverse())
+  const triangles = []
+
+  if (topFace) triangles.push(...polygonFaceTriangles(outer, holes, z1, 'top'))
+  if (bottomFace) triangles.push(...polygonFaceTriangles(outer, holes, z0, 'bottom'))
+
+  addOuterWalls(triangles, outer, z0, z1)
+  for (const hole of holes) addHoleWalls(triangles, hole, z0, z1)
+  return triangles
+}
+
+function appendInsetFaceTriangles(target, outerProfile, polygons, z0, z1, face) {
+  const shellHoles = polygons.map(poly => poly.outer)
+  const shellOptions = face === 'top'
+    ? { topFace: true, bottomFace: false }
+    : { topFace: false, bottomFace: true }
+
+  target.push(...extrudePolygonWithHoles(outerProfile, shellHoles, z0, z1, shellOptions))
+
+  for (const poly of polygons) {
+    target.push(...polygonFaceTriangles(poly.outer, poly.holes, face === 'top' ? z0 : z1, face))
+    for (const island of poly.holes) {
+      const islandOptions = face === 'top'
+        ? { topFace: true, bottomFace: false }
+        : { topFace: false, bottomFace: true }
+      target.push(...extrudePolygonWithHoles(island, [], z0, z1, islandOptions))
+    }
+  }
+}
+
+function buildInsetBodyTriangles(outerProfile, zBot, zTop, depth, topPolygons, bottomPolygons) {
+  const insetDepth = Math.min(depth, (zTop - zBot) / 2)
+  const topCavityZ = zTop - insetDepth
+  const bottomCavityZ = zBot + insetDepth
+  const triangles = []
+
+  if (topPolygons.length > 0 && bottomPolygons.length > 0) {
+    if (topCavityZ > bottomCavityZ) {
+      triangles.push(...extrudePolygon(outerProfile, bottomCavityZ, topCavityZ, { topFace: false, bottomFace: false }))
+    }
+  } else if (topPolygons.length > 0) {
+    triangles.push(...extrudePolygon(outerProfile, zBot, topCavityZ, { topFace: false, bottomFace: true }))
+  } else if (bottomPolygons.length > 0) {
+    triangles.push(...extrudePolygon(outerProfile, bottomCavityZ, zTop, { topFace: true, bottomFace: false }))
+  } else {
+    triangles.push(...extrudePolygon(outerProfile, zBot, zTop))
+  }
+
+  if (topPolygons.length > 0) {
+    appendInsetFaceTriangles(triangles, outerProfile, topPolygons, topCavityZ, zTop, 'top')
+  }
+  if (bottomPolygons.length > 0) {
+    appendInsetFaceTriangles(triangles, outerProfile, bottomPolygons, zBot, bottomCavityZ, 'bottom')
+  }
+
+  return triangles
+}
+
+function triangleAreaXY(points) {
+  let area = 0
+  for (let i = 0; i < points.length; i++) {
+    const j = (i + 1) % points.length
+    area += points[i].x * points[j].y - points[j].x * points[i].y
+  }
+  return area / 2
+}
+
+function hashVertex3D(v) {
+  const q = (n) => Math.round(n * 1e6)
+  return `${q(v.x)},${q(v.y)},${q(v.z)}`
+}
+
+function sealTriangularHoles(triangles) {
+  const edgeCounts = new Map()
+  const adjacency = new Map()
+  const vertices = new Map()
+
+  for (const tri of triangles) {
+    for (const vertex of tri) {
+      vertices.set(hashVertex3D(vertex), vertex)
+    }
+    const edges = [[tri[0], tri[1]], [tri[1], tri[2]], [tri[2], tri[0]]]
+    for (const [a, b] of edges) {
+      const ka = hashVertex3D(a)
+      const kb = hashVertex3D(b)
+      const key = ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`
+      edgeCounts.set(key, (edgeCounts.get(key) || 0) + 1)
+    }
+  }
+
+  for (const [key, count] of edgeCounts.entries()) {
+    if (count !== 1) continue
+    const [a, b] = key.split('|')
+    if (!adjacency.has(a)) adjacency.set(a, new Set())
+    if (!adjacency.has(b)) adjacency.set(b, new Set())
+    adjacency.get(a).add(b)
+    adjacency.get(b).add(a)
+  }
+
+  const added = []
+  const visited = new Set()
+  for (const start of adjacency.keys()) {
+    if (visited.has(start)) continue
+    const stack = [start]
+    const component = []
+    visited.add(start)
+
+    while (stack.length > 0) {
+      const current = stack.pop()
+      component.push(current)
+      for (const next of adjacency.get(current) || []) {
+        if (visited.has(next)) continue
+        visited.add(next)
+        stack.push(next)
+      }
+    }
+
+    if (component.length !== 3) continue
+    if (!component.every((key) => (adjacency.get(key) || new Set()).size === 2)) continue
+
+    const patch = component.map((key) => vertices.get(key))
+    const zValues = patch.map((vertex) => vertex.z)
+    const sameZ = zValues.every((z) => Math.abs(z - zValues[0]) < 1e-6)
+    if (!sameZ) continue
+
+    const desiredTop = zValues[0] >= 0
+    const area = triangleAreaXY(patch)
+    if ((desiredTop && area < 0) || (!desiredTop && area > 0)) {
+      patch.reverse()
+    }
+
+    added.push(patch)
+  }
+
+  return added.length > 0 ? [...triangles, ...added] : triangles
+}
+
+function sealPlanarHoles(triangles) {
+  if (!triangles || triangles.length === 0) return triangles
+
+  const edgeCounts = new Map()
+  const adjacency = new Map()
+  const vertices = new Map()
+  let minZ = Infinity
+  let maxZ = -Infinity
+
+  for (const tri of triangles) {
+    for (const vertex of tri) {
+      const key = hashVertex3D(vertex)
+      vertices.set(key, vertex)
+      if (vertex.z < minZ) minZ = vertex.z
+      if (vertex.z > maxZ) maxZ = vertex.z
+    }
+    for (const [a, b] of [[tri[0], tri[1]], [tri[1], tri[2]], [tri[2], tri[0]]]) {
+      const ka = hashVertex3D(a)
+      const kb = hashVertex3D(b)
+      const key = ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`
+      edgeCounts.set(key, (edgeCounts.get(key) || 0) + 1)
+    }
+  }
+
+  for (const [key, count] of edgeCounts.entries()) {
+    if (count !== 1) continue
+    const [a, b] = key.split('|')
+    if (!adjacency.has(a)) adjacency.set(a, new Set())
+    if (!adjacency.has(b)) adjacency.set(b, new Set())
+    adjacency.get(a).add(b)
+    adjacency.get(b).add(a)
+  }
+
+  const midZ = (minZ + maxZ) / 2
+  const visited = new Set()
+  const added = []
+
+  for (const start of adjacency.keys()) {
+    if (visited.has(start)) continue
+    const component = []
+    const stack = [start]
+    visited.add(start)
+
+    while (stack.length > 0) {
+      const current = stack.pop()
+      component.push(current)
+      for (const next of adjacency.get(current) || []) {
+        if (visited.has(next)) continue
+        visited.add(next)
+        stack.push(next)
+      }
+    }
+
+    if (component.length < 3) continue
+    if (!component.every((key) => (adjacency.get(key) || new Set()).size === 2)) continue
+
+    const zValues = component.map((key) => vertices.get(key).z)
+    const sameZ = zValues.every((z) => Math.abs(z - zValues[0]) < 1e-6)
+    if (!sameZ) continue
+
+    const orderedKeys = []
+    let previous = null
+    let current = start
+    while (true) {
+      orderedKeys.push(current)
+      const neighbors = [...(adjacency.get(current) || [])]
+      const next = neighbors.find((key) => key !== previous)
+      if (!next || next === start) break
+      previous = current
+      current = next
+      if (orderedKeys.length > component.length + 1) break
+    }
+
+    if (orderedKeys.length !== component.length) continue
+    const polygon = orderedKeys.map((key) => vertices.get(key))
+    const face = zValues[0] >= midZ ? 'top' : 'bottom'
+    const area = triangleAreaXY(polygon)
+    if ((face === 'top' && area < 0) || (face === 'bottom' && area > 0)) {
+      polygon.reverse()
+    }
+
+    added.push(...polygonFaceTriangles(polygon, [], zValues[0], face))
+  }
+
+  return added.length > 0 ? [...triangles, ...added] : triangles
+}
+
+function shrinkPolygonsUniform(polygons, clearance) {
+  if (polygons.length === 0 || clearance <= 0) return polygons
+  let currentMaxRadius = 0
+
+  for (const poly of polygons) {
+    for (const pts of [poly.outer, ...poly.holes]) {
+      for (const pt of pts) {
+        currentMaxRadius = Math.max(currentMaxRadius, Math.hypot(pt.x, pt.y))
+      }
+    }
+  }
+
+  if (currentMaxRadius <= clearance) return polygons
+
+  const scale = (currentMaxRadius - clearance) / currentMaxRadius
+  return polygons.map((poly) => ({
+    outer: poly.outer.map((pt) => ({ x: pt.x * scale, y: pt.y * scale })),
+    holes: poly.holes.map((hole) => hole.map((pt) => ({ x: pt.x * scale, y: pt.y * scale }))),
+  }))
+}
+
+function buildInsetTextTriangles(polygons, z0, z1) {
+  const triangles = []
+  if (!polygons || polygons.length === 0 || z1 <= z0) return triangles
+
+  for (const poly of polygons) {
+    triangles.push(...extrudePolygonWithHoles(poly.outer, poly.holes, z0, z1))
+  }
+  return sealPlanarHoles(triangles)
+}
+
+function getInsetSafeRadius(bodyRadius, grooveCount, grooveRadius) {
+  const baseRadius = grooveCount > 0
+    ? getGrooveCenterRadius(bodyRadius, grooveRadius) - grooveRadius
+    : bodyRadius
+  return Math.max(baseRadius - 3.5, bodyRadius * 0.45)
+}
+
+function createClassicBodyProfile(bodyRadius, grooveCount, grooveRadius, grooveSegments, bodySegments, grooveCenterRadius = getGrooveCenterRadius(bodyRadius, grooveRadius)) {
   if (grooveCount <= 0) return null
 
-  const grooveCenterRadius = getGrooveCenterRadius(bodyRadius, grooveRadius)
   const grooveArc = getGrooveIntersectionInfo(bodyRadius, grooveCenterRadius, grooveRadius)
   if (!grooveArc) return null
 
@@ -401,17 +715,47 @@ function commandsToPolygons(commands) {
     contours[i] = simplifyContour(contours[i])
   }
 
-  // Classify by signed area
-  const polys = []
-  for (const c of contours) {
-    const a = signedArea(c)
-    if (a < 0) {
-      polys.push({ outer: c, holes: [] })
-    } else if (a > 0 && polys.length > 0) {
-      polys[polys.length - 1].holes.push(c)
-    }
+  // Classify by signed area, then attach each hole to the smallest containing outer.
+  const outers = []
+  const holes = []
+  for (const contour of contours) {
+    const area = signedArea(contour)
+    if (area < 0) outers.push(contour)
+    else if (area > 0) holes.push(contour)
   }
+
+  const polys = outers.map((outer) => ({ outer, holes: [] }))
+  for (const hole of holes) {
+    const sample = hole[0]
+    let ownerIndex = -1
+    let ownerArea = Infinity
+    for (let i = 0; i < polys.length; i++) {
+      if (!pointInPolygon(sample, polys[i].outer)) continue
+      const area = Math.abs(signedArea(polys[i].outer))
+      if (area < ownerArea) {
+        ownerIndex = i
+        ownerArea = area
+      }
+    }
+    if (ownerIndex >= 0) polys[ownerIndex].holes.push(hole)
+    else polys.push({ outer: [...hole].reverse(), holes: [] })
+  }
+
   return polys
+}
+
+function pointInPolygon(point, polygon) {
+  let inside = false
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x
+    const yi = polygon[i].y
+    const xj = polygon[j].x
+    const yj = polygon[j].y
+    const intersects = ((yi > point.y) !== (yj > point.y))
+      && (point.x < ((xj - xi) * (point.y - yi)) / ((yj - yi) || 1e-12) + xi)
+    if (intersects) inside = !inside
+  }
+  return inside
 }
 
 function simplifyContour(points) {
@@ -445,11 +789,15 @@ function simplifyContour(points) {
         continue
       }
 
-      const base = Math.hypot(next.x - prev.x, next.y - prev.y)
-      const cross = Math.abs((cur.x - prev.x) * (next.y - prev.y) - (cur.y - prev.y) * (next.x - prev.x))
-      const height = base > 0 ? cross / base : 0
+      const abx = cur.x - prev.x
+      const aby = cur.y - prev.y
+      const bcx = next.x - cur.x
+      const bcy = next.y - cur.y
+      const lab = Math.hypot(abx, aby)
+      const lbc = Math.hypot(bcx, bcy)
+      const cross = Math.abs(abx * bcy - aby * bcx)
 
-      if (height < DIST_EPS) {
+      if (lab <= DIST_EPS || lbc <= DIST_EPS || cross <= DIST_EPS * (lab + lbc)) {
         changed = true
         continue
       }
@@ -677,61 +1025,90 @@ async function generateSTLFiles(params, outputDir, onProgress) {
   const R = diameter / 2
   const halfT = thickness / 2
   const SEG = 64
+  const grooveCenterRadius = getGrooveCenterRadius(R, grooveRadius)
 
   const sanitized = (name || 'chip').replace(/[^a-zA-Z0-9\u4e00-\u9fff]/g, '')
   const folder = path.join(outputDir, `chip_${sanitized}_${value || '0'}`)
   fs.mkdirSync(folder, { recursive: true })
 
   const parts = {}
+  const bodyProfile = (style === 'classic' || style === 'engraved') && grooveCount > 0
+    ? createClassicBodyProfile(R, grooveCount, grooveRadius + GROOVE_GAP, 24, 16, grooveCenterRadius)
+    : null
 
   // 1. Body
   onProgress?.({ stage: 'generating', percent: 10, detail: t(currentLocale, 'body') })
-  if (style === 'classic' && grooveCount > 0) {
-    const bodyProfile = createClassicBodyProfile(R, grooveCount, grooveRadius + GAP, 24, 16)
-    parts.body = bodyProfile ? extrudePolygon(bodyProfile, -halfT, halfT) : solidCylinder(R, -halfT, halfT, SEG)
+  if (bodyProfile) {
+    parts.body = extrudePolygon(bodyProfile, -halfT, halfT)
   } else {
     parts.body = solidCylinder(R, -halfT, halfT, SEG)
   }
 
-  // 2. Name text: sits on top face (+Z) with GAP separation from body
-  onProgress?.({ stage: 'generating', percent: 25, detail: t(currentLocale, 'nameText') })
   const fontFile = fontPath || DEFAULT_FONT_PATH
-  if (name) {
-    const rawText = generateTextTriangles(name, fontFile, R * 0.4, textDepth)
-    if (rawText.length > 0) {
-      parts.nameText = translate(rawText, 0, 0, halfT + GAP)
+  const insetSafeRadius = getInsetSafeRadius(R, grooveCount, grooveRadius)
+  const namePolygons = name ? fitPolygonsWithinRadius(generateTextPolygons(name, fontFile, R * 0.4), insetSafeRadius) : []
+  const valuePolygons = value ? mirrorPolygonsForBottom(fitPolygonsWithinRadius(generateTextPolygons(value, fontFile, R * 0.5), insetSafeRadius)) : []
+  const insetNamePolygons = shrinkPolygonsUniform(namePolygons, INSET_SIDE_GAP)
+  const insetValuePolygons = shrinkPolygonsUniform(valuePolygons, INSET_SIDE_GAP)
+
+  if (style === 'engraved' && (namePolygons.length > 0 || valuePolygons.length > 0)) {
+    onProgress?.({ stage: 'generating', percent: 25, detail: t(currentLocale, 'engravedText') })
+    const outerProfile = bodyProfile || circleVerts(R, SEG)
+    parts.body = sealPlanarHoles(sealTriangularHoles(
+      buildInsetBodyTriangles(outerProfile, -halfT, halfT, textDepth, namePolygons, valuePolygons)
+    ))
+    const insetZ0Top = halfT - textDepth + PART_GAP
+    const insetZ1Top = halfT - PART_GAP
+    const insetZ0Bottom = -halfT + PART_GAP
+    const insetZ1Bottom = -halfT + textDepth - PART_GAP
+
+    if (insetNamePolygons.length > 0 && insetZ1Top > insetZ0Top) {
+      parts.nameText = buildInsetTextTriangles(insetNamePolygons, insetZ0Top, insetZ1Top)
+    }
+    if (insetValuePolygons.length > 0 && insetZ1Bottom > insetZ0Bottom) {
+      parts.valueText = buildInsetTextTriangles(insetValuePolygons, insetZ0Bottom, insetZ1Bottom)
+    }
+  } else {
+    // 2. Name text: sits on top face (+Z) with PART_GAP separation from body
+    onProgress?.({ stage: 'generating', percent: 25, detail: t(currentLocale, 'nameText') })
+    if (namePolygons.length > 0) {
+      const rawText = generateTextTriangles(name, fontFile, R * 0.4, textDepth)
+      if (rawText.length > 0) {
+        parts.nameText = translate(rawText, 0, 0, halfT + PART_GAP)
+      }
     }
   }
 
-  // 3. Value text: sits on bottom face (-Z) with GAP separation from body
-  onProgress?.({ stage: 'generating', percent: 40, detail: t(currentLocale, 'valueText') })
-  if (value) {
-    const rawVal = generateTextTriangles(value, fontFile, R * 0.5, textDepth)
-    if (rawVal.length > 0) {
-      const flipped = rotateY180(rawVal)
-      parts.valueText = translate(flipped, 0, 0, -halfT - GAP)
+  // 3. Value text: sits on bottom face (-Z) with PART_GAP separation from body
+  if (style !== 'engraved') {
+    onProgress?.({ stage: 'generating', percent: 40, detail: t(currentLocale, 'valueText') })
+    if (value) {
+      const rawVal = generateTextTriangles(value, fontFile, R * 0.5, textDepth)
+      if (rawVal.length > 0) {
+        const flipped = rotateY180(rawVal)
+        parts.valueText = translate(flipped, 0, 0, -halfT - PART_GAP)
+      }
     }
   }
 
   // 4. Grooves / full round edge cylinders (classic style)
-  if (style === 'classic' && grooveCount > 0) {
+  if ((style === 'classic' || style === 'engraved') && grooveCount > 0) {
     onProgress?.({ stage: 'generating', percent: 55, detail: t(currentLocale, 'grooves') })
     const spotTris = []
-    const centerRadius = getGrooveCenterRadius(R, grooveRadius)
     for (let i = 0; i < grooveCount; i++) {
       const angle = (i / grooveCount) * 2 * Math.PI
-      spotTris.push(...solidEdgeSpot(angle, centerRadius, grooveRadius, -halfT, halfT, 24))
+      spotTris.push(...solidEdgeSpot(angle, grooveCenterRadius, grooveRadius, -halfT, halfT, 24))
     }
     parts.grooves = spotTris
   }
 
-  // 5. Rim rings: sit on top & bottom faces with GAP separation from body
+  // 5. Rim rings: sit on top & bottom faces with PART_GAP separation from body
   onProgress?.({ stage: 'generating', percent: 70, detail: t(currentLocale, 'rimRing') })
   const rimOuter = R - 0.5
   const rimInner = rimOuter - rimWidth
-  if (rimInner > 0) {
-    const topRim = solidRing(rimOuter, rimInner, halfT + GAP, halfT + GAP + textDepth, SEG)
-    const botRim = solidRing(rimOuter, rimInner, -(halfT + GAP + textDepth), -(halfT + GAP), SEG)
+  if (style !== 'engraved' && rimInner > 0) {
+    const topRim = solidRing(rimOuter, rimInner, halfT + PART_GAP, halfT + PART_GAP + textDepth, SEG)
+    const botRim = solidRing(rimOuter, rimInner, -(halfT + PART_GAP + textDepth), -(halfT + PART_GAP), SEG)
     parts.rimRing = [...topRim, ...botRim]
   }
 

@@ -1,6 +1,8 @@
 import * as THREE from 'three'
-import earcut from 'earcut'
 import opentype from 'opentype.js'
+
+const INSET_SIDE_GAP = 0.03
+const HOLE_JITTER = 1e-4
 
 /**
  * Generate chip part geometries for 3D preview.
@@ -27,10 +29,13 @@ export function generateChipGeometries(config, fontData) {
   const R = diameter / 2
   const halfT = thickness / 2
   const parts = {}
+  const bodyProfile = (style === 'classic' || style === 'engraved') && grooveCount > 0
+    ? createClassicBodyProfile(R, grooveCount, grooveRadius, 48, 24)
+    : null
 
   // 1. Body
-  if (style === 'classic' && grooveCount > 0) {
-    parts.body = createClassicBodyGeometry(R, grooveCount, grooveRadius, thickness, 48, 24)
+  if (bodyProfile) {
+    parts.body = createExtrudedShapeGeometry(bodyProfile, thickness)
   } else {
     const bodyGeo = new THREE.CylinderGeometry(R, R, thickness, 64)
     bodyGeo.rotateX(Math.PI / 2) // Z-axis = thickness
@@ -38,22 +43,26 @@ export function generateChipGeometries(config, fontData) {
   }
 
   // 2. Name text (protrudes from top face, z = halfT to halfT + textDepth)
-  const nameParts = createTextGeometry(name, R * 0.35, textDepth, fontData)
-  if (nameParts) {
-    nameParts.translate(0, 0, halfT) // bottom of extrusion at body surface
-    parts.nameText = nameParts
+  if (style !== 'engraved') {
+    const nameParts = createTextGeometry(name, R * 0.35, textDepth, fontData)
+    if (nameParts) {
+      nameParts.translate(0, 0, halfT) // bottom of extrusion at body surface
+      parts.nameText = nameParts
+    }
   }
 
   // 3. Value text (protrudes from bottom face)
-  const valueParts = createTextGeometry(value, R * 0.45, textDepth, fontData)
-  if (valueParts) {
-    valueParts.rotateY(Math.PI)
-    valueParts.translate(0, 0, -halfT) // top of extrusion at body surface
-    parts.valueText = valueParts
+  if (style !== 'engraved') {
+    const valueParts = createTextGeometry(value, R * 0.45, textDepth, fontData)
+    if (valueParts) {
+      valueParts.rotateY(Math.PI)
+      valueParts.translate(0, 0, -halfT) // top of extrusion at body surface
+      parts.valueText = valueParts
+    }
   }
 
   // 4. Grooves — full round cylinders embedded into the edge (classic only)
-  if (style === 'classic' && grooveCount > 0) {
+  if ((style === 'classic' || style === 'engraved') && grooveCount > 0) {
     const spotGeos = []
     const centerRadius = getGrooveCenterRadius(R, grooveRadius)
     for (let i = 0; i < grooveCount; i++) {
@@ -69,7 +78,7 @@ export function generateChipGeometries(config, fontData) {
   // 5. Rim rings — protrude outward from top and bottom faces
   const rimOuter = R - 0.5
   const rimInner = rimOuter - rimWidth
-  if (rimInner > 0) {
+  if (style !== 'engraved' && rimInner > 0) {
     const rimShape = new THREE.Shape()
     rimShape.absarc(0, 0, rimOuter, 0, Math.PI * 2, false)
     const rimHole = new THREE.Path()
@@ -94,6 +103,10 @@ export function generateChipGeometries(config, fontData) {
     parts.rimRing = mergeBufferGeometries([topRim, botRim])
   }
 
+  if (style === 'engraved') {
+    applyInsetPreview(parts, name, value, fontData, R * 0.35, R * 0.45, textDepth, bodyProfile, R, grooveCount, grooveRadius, thickness)
+  }
+
   return parts
 }
 
@@ -101,24 +114,39 @@ export function generateChipGeometries(config, fontData) {
  * Create text geometry from a font outline for accurate preview.
  */
 function createTextGeometry(text, fontSize, depth, fontData) {
-  if (!text || !fontData) return null
+  const polygons = getTextPolygons(text, fontSize, fontData)
+  if (polygons.length === 0) return null
+  const geometries = []
+
+  for (const poly of polygons) {
+    const shape = polygonToShape(poly.outer, poly.holes)
+    if (!shape) continue
+    geometries.push(new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false }))
+  }
+
+  if (geometries.length === 0) return null
+  return mergeBufferGeometries(geometries)
+}
+
+function getTextPolygons(text, fontSize, fontData) {
+  if (!text || !fontData) return []
 
   let font
   try {
     font = opentype.parse(fontData)
   } catch {
-    return null
+    return []
   }
 
   const otPath = font.getPath(text, 0, 0, fontSize)
-  const polygons = commandsToPolygons(otPath.commands || [])
-  if (polygons.length === 0) return null
+  const rawPolygons = commandsToPolygons(otPath.commands || [])
+  if (rawPolygons.length === 0) return []
 
   let minX = Infinity
   let maxX = -Infinity
   let minY = Infinity
   let maxY = -Infinity
-  for (const poly of polygons) {
+  for (const poly of rawPolygons) {
     for (const pts of [poly.outer, ...poly.holes]) {
       for (const pt of pts) {
         minX = Math.min(minX, pt.x)
@@ -131,20 +159,105 @@ function createTextGeometry(text, fontSize, depth, fontData) {
 
   const cx = (minX + maxX) / 2
   const cy = (minY + maxY) / 2
-  const geometries = []
-
-  for (const poly of polygons) {
+  return stabilizePolygons(rawPolygons.map((poly) => {
     const outerRaw = poly.outer.map((p) => ({ x: p.x - cx, y: -(p.y - cy) }))
     const holesRaw = poly.holes.map((hole) => hole.map((p) => ({ x: p.x - cx, y: -(p.y - cy) })))
-    const outer = signedArea2D(outerRaw) >= 0 ? outerRaw : [...outerRaw].reverse()
-    const holes = holesRaw.map((hole) => (signedArea2D(hole) <= 0 ? hole : [...hole].reverse()))
-    const shape = polygonToShape(outer, holes)
-    if (!shape) continue
-    geometries.push(new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false }))
+    return {
+      outer: signedArea2D(outerRaw) >= 0 ? outerRaw : [...outerRaw].reverse(),
+      holes: holesRaw.map((hole) => (signedArea2D(hole) <= 0 ? hole : [...hole].reverse())),
+    }
+  }))
+}
+
+function stabilizePolygons(polygons) {
+  return polygons.map((poly) => {
+    if (!poly.holes || poly.holes.length === 0) return poly
+
+    return {
+      outer: poly.outer,
+      holes: poly.holes.map((hole, index) => {
+        const dy = (index + 1) * HOLE_JITTER
+        return hole.map((pt) => ({ x: pt.x, y: pt.y + dy }))
+      }),
+    }
+  })
+}
+
+function applyInsetPreview(parts, frontText, backText, fontData, frontFontSize, backFontSize, textDepth, bodyProfile, bodyRadius, grooveCount, grooveRadius, thickness) {
+  const safeRadius = getInsetSafeRadius(bodyRadius, grooveCount, grooveRadius)
+  const frontPolygons = fitPolygonsWithinRadius(getTextPolygons(frontText, frontFontSize, fontData), safeRadius)
+  const backPolygons = mirrorPolygonsForBottom(fitPolygonsWithinRadius(getTextPolygons(backText, backFontSize, fontData), safeRadius))
+  if (frontPolygons.length === 0 && backPolygons.length === 0) return
+
+  const insetDepth = Math.min(textDepth, thickness / 2)
+  const halfT = thickness / 2
+  const topCavityZ = halfT - insetDepth
+  const bottomCavityZ = -halfT + insetDepth
+  const components = []
+  const outerProfile = bodyProfile || createCircleProfile(bodyRadius, 64)
+
+  if (frontPolygons.length > 0 && backPolygons.length > 0) {
+    const middleHeight = topCavityZ - bottomCavityZ
+    if (middleHeight > 0) {
+      components.push(createExtrudedShapeGeometry(outerProfile, middleHeight))
+    }
+  } else if (frontPolygons.length > 0) {
+    const baseHeight = thickness - insetDepth
+    const base = createExtrudedShapeGeometry(outerProfile, baseHeight)
+    base.translate(0, 0, -insetDepth / 2)
+    components.push(base)
+  } else if (backPolygons.length > 0) {
+    const baseHeight = thickness - insetDepth
+    const base = createExtrudedShapeGeometry(outerProfile, baseHeight)
+    base.translate(0, 0, insetDepth / 2)
+    components.push(base)
   }
 
-  if (geometries.length === 0) return null
-  return mergeBufferGeometries(geometries)
+  if (frontPolygons.length > 0) {
+    addInsetShellGeometry(components, outerProfile, frontPolygons, topCavityZ, insetDepth)
+    parts.nameText = createInsetTextGeometry(
+      shrinkPolygonsUniform(frontPolygons, INSET_SIDE_GAP),
+      topCavityZ + 0.001,
+      insetDepth - 0.002
+    )
+  }
+  if (backPolygons.length > 0) {
+    addInsetShellGeometry(components, outerProfile, backPolygons, -halfT, insetDepth)
+    parts.valueText = createInsetTextGeometry(
+      shrinkPolygonsUniform(backPolygons, INSET_SIDE_GAP),
+      -halfT + 0.001,
+      insetDepth - 0.002
+    )
+  }
+
+  parts.body = mergeBufferGeometries(components)
+}
+
+function addInsetShellGeometry(components, outerProfile, polygons, startZ, depth) {
+  const shellShape = polygonToShape(outerProfile, [])
+  if (!shellShape) return
+
+  for (const poly of polygons) {
+    const holePath = new THREE.Path()
+    holePath.moveTo(poly.outer[0].x, poly.outer[0].y)
+    for (let i = 1; i < poly.outer.length; i++) {
+      holePath.lineTo(poly.outer[i].x, poly.outer[i].y)
+    }
+    holePath.closePath()
+    shellShape.holes.push(holePath)
+
+    for (const island of poly.holes) {
+      const islandShape = polygonToShape(island, [])
+      if (!islandShape) continue
+      const islandGeo = new THREE.ExtrudeGeometry(islandShape, { depth, bevelEnabled: false })
+      islandGeo.translate(0, 0, startZ)
+      components.push(islandGeo)
+    }
+  }
+
+  const shell = new THREE.ExtrudeGeometry(shellShape, { depth, bevelEnabled: false })
+  shell.translate(0, 0, startZ)
+  components.push(shell)
 }
 
 function polygonToShape(outer, holes) {
@@ -230,24 +343,49 @@ function commandsToPolygons(commands) {
     contours[i] = simplifyContour(contours[i])
   }
 
-  const polys = []
+  const outers = []
+  const holes = []
   for (const contour of contours) {
     const area = signedArea2D(contour)
-    if (area < 0) {
-      polys.push({ outer: contour, holes: [] })
-    } else if (area > 0 && polys.length > 0) {
-      polys[polys.length - 1].holes.push(contour)
+    if (area < 0) outers.push(contour)
+    else if (area > 0) holes.push(contour)
+  }
+
+  const polys = outers.map((outer) => ({ outer, holes: [] }))
+  for (const hole of holes) {
+    const sample = hole[0]
+    let ownerIndex = -1
+    let ownerArea = Infinity
+    for (let i = 0; i < polys.length; i++) {
+      if (!pointInPolygon2D(sample, polys[i].outer)) continue
+      const area = Math.abs(signedArea2D(polys[i].outer))
+      if (area < ownerArea) {
+        ownerIndex = i
+        ownerArea = area
+      }
     }
+    if (ownerIndex >= 0) polys[ownerIndex].holes.push(hole)
+    else polys.push({ outer: [...hole].reverse(), holes: [] })
   }
 
   return polys
 }
 
-/**
- * Create the classic body with cylindrical sockets on the edge.
- */
-function createClassicBodyGeometry(bodyRadius, grooveCount, grooveRadius, thickness, grooveSegments, bodySegments) {
-  const profile = createClassicBodyProfile(bodyRadius, grooveCount, grooveRadius, grooveSegments, bodySegments)
+function pointInPolygon2D(point, polygon) {
+  let inside = false
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const xi = polygon[i].x
+    const yi = polygon[i].y
+    const xj = polygon[j].x
+    const yj = polygon[j].y
+    const intersects = ((yi > point.y) !== (yj > point.y))
+      && (point.x < ((xj - xi) * (point.y - yi)) / ((yj - yi) || 1e-12) + xi)
+    if (intersects) inside = !inside
+  }
+  return inside
+}
+
+function createExtrudedShapeGeometry(profile, depth) {
   if (!profile || profile.length < 3) return null
 
   const shape = new THREE.Shape()
@@ -258,17 +396,16 @@ function createClassicBodyGeometry(bodyRadius, grooveCount, grooveRadius, thickn
   shape.closePath()
 
   const geo = new THREE.ExtrudeGeometry(shape, {
-    depth: thickness,
+    depth,
     bevelEnabled: false,
   })
-  geo.translate(0, 0, -thickness / 2)
+  geo.translate(0, 0, -depth / 2)
   return geo
 }
 
-function createClassicBodyProfile(bodyRadius, grooveCount, grooveRadius, grooveSegments, bodySegments) {
+function createClassicBodyProfile(bodyRadius, grooveCount, grooveRadius, grooveSegments, bodySegments, grooveCenterRadius = getGrooveCenterRadius(bodyRadius, grooveRadius)) {
   if (grooveCount <= 0) return null
 
-  const grooveCenterRadius = getGrooveCenterRadius(bodyRadius, grooveRadius)
   const grooveArc = getGrooveIntersectionInfo(bodyRadius, grooveCenterRadius, grooveRadius)
   if (!grooveArc) return null
 
@@ -288,6 +425,93 @@ function createClassicBodyProfile(bodyRadius, grooveCount, grooveRadius, grooveS
 
 function getGrooveCenterRadius(bodyRadius, radius) {
   return bodyRadius - radius / 3
+}
+
+function mirrorPolygonsForBottom(polygons) {
+  return polygons.map((poly) => {
+    const outerRaw = poly.outer.map((p) => ({ x: -p.x, y: p.y }))
+    const holesRaw = poly.holes.map((hole) => hole.map((p) => ({ x: -p.x, y: p.y })))
+    return {
+      outer: signedArea2D(outerRaw) >= 0 ? outerRaw : [...outerRaw].reverse(),
+      holes: holesRaw.map((hole) => (signedArea2D(hole) <= 0 ? hole : [...hole].reverse())),
+    }
+  })
+}
+
+function shrinkPolygonsUniform(polygons, clearance) {
+  if (polygons.length === 0 || clearance <= 0) return polygons
+  let currentMaxRadius = 0
+
+  for (const poly of polygons) {
+    for (const pts of [poly.outer, ...poly.holes]) {
+      for (const pt of pts) {
+        currentMaxRadius = Math.max(currentMaxRadius, Math.hypot(pt.x, pt.y))
+      }
+    }
+  }
+
+  if (currentMaxRadius <= clearance) return polygons
+
+  const scale = (currentMaxRadius - clearance) / currentMaxRadius
+  return polygons.map((poly) => ({
+    outer: poly.outer.map((pt) => ({ x: pt.x * scale, y: pt.y * scale })),
+    holes: poly.holes.map((hole) => hole.map((pt) => ({ x: pt.x * scale, y: pt.y * scale }))),
+  }))
+}
+
+function createInsetTextGeometry(polygons, startZ, depth) {
+  if (polygons.length === 0 || depth <= 0) return null
+  const geometries = []
+
+  for (const poly of polygons) {
+    const shape = polygonToShape(poly.outer, poly.holes)
+    if (!shape) continue
+    const geometry = new THREE.ExtrudeGeometry(shape, { depth, bevelEnabled: false })
+    geometry.translate(0, 0, startZ)
+    geometries.push(geometry)
+  }
+
+  return mergeBufferGeometries(geometries)
+}
+
+function fitPolygonsWithinRadius(polygons, maxRadius) {
+  if (polygons.length === 0) return polygons
+  let currentMaxRadius = 0
+
+  for (const poly of polygons) {
+    for (const pts of [poly.outer, ...poly.holes]) {
+      for (const pt of pts) {
+        currentMaxRadius = Math.max(currentMaxRadius, Math.hypot(pt.x, pt.y))
+      }
+    }
+  }
+
+  if (currentMaxRadius <= 0 || currentMaxRadius <= maxRadius) return polygons
+
+  const scale = maxRadius / currentMaxRadius
+  return polygons.map((poly) => ({
+    outer: poly.outer.map((pt) => ({ x: pt.x * scale, y: pt.y * scale })),
+    holes: poly.holes.map((hole) => hole.map((pt) => ({ x: pt.x * scale, y: pt.y * scale }))),
+  }))
+}
+
+function getInsetSafeRadius(bodyRadius, grooveCount, grooveRadius) {
+  const baseRadius = grooveCount > 0
+    ? getGrooveCenterRadius(bodyRadius, grooveRadius) - grooveRadius
+    : bodyRadius
+  return Math.max(baseRadius - 3.5, bodyRadius * 0.45)
+}
+
+function createCircleProfile(radius, segments) {
+  const profile = []
+  for (let i = 0; i < segments; i++) {
+    const angle = (i / segments) * Math.PI * 2
+    profile.push({
+      x: Math.cos(angle) * radius,
+      y: Math.sin(angle) * radius,
+    })
+  }
+  return profile
 }
 
 function getGrooveIntersectionInfo(bodyRadius, centerRadius, radius) {
@@ -377,11 +601,15 @@ function simplifyContour(points) {
         continue
       }
 
-      const base = Math.hypot(next.x - prev.x, next.y - prev.y)
-      const cross = Math.abs((cur.x - prev.x) * (next.y - prev.y) - (cur.y - prev.y) * (next.x - prev.x))
-      const height = base > 0 ? cross / base : 0
+      const abx = cur.x - prev.x
+      const aby = cur.y - prev.y
+      const bcx = next.x - cur.x
+      const bcy = next.y - cur.y
+      const lab = Math.hypot(abx, aby)
+      const lbc = Math.hypot(bcx, bcy)
+      const cross = Math.abs(abx * bcy - aby * bcx)
 
-      if (height < DIST_EPS) {
+      if (lab <= DIST_EPS || lbc <= DIST_EPS || cross <= DIST_EPS * (lab + lbc)) {
         changed = true
         continue
       }
